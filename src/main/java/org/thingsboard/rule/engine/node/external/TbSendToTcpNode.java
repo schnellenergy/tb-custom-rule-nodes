@@ -24,8 +24,8 @@ import java.net.Socket;
     type = ComponentType.EXTERNAL,
     name = "tcp request",
     configClazz = TbSendToTcpNodeConfiguration.class,
-    nodeDescription = "Send message data to a TCP endpoint. Target IP, port, and TLS/PEM secrets are provided via message metadata.",
-    nodeDetails = "Reads target host, port, and TLS/PEM configuration from metadata using configurable keys. Supports both plain TCP and TLS (with in-memory trust/key stores from PEM).",
+    nodeDescription = "Send message data to a TCP endpoint. Target IP, port, and TLS/PEM secrets are provided via message metadata or message body using templatized keys.",
+    nodeDetails = "Reads target host, port, and TLS/PEM configuration from metadata or message using templatized keys (e.g., ${metadata.key}, ${msg.key}). Supports both plain TCP and TLS (with in-memory trust/key stores from PEM).",
     uiResources = {"static/rulenode/custom-nodes-config.js"},
     configDirective = "tbExternalNodeSendToTcpConfig",
     icon = "call_made"
@@ -49,9 +49,9 @@ public class TbSendToTcpNode implements TbNode {
 
     @Override
     public void onMsg(TbContext ctx, TbMsg msg) {
-        String targetHost = msg.getMetaData().getValue(hostKey);
-        String portStr = msg.getMetaData().getValue(portKey);
-        String tlsStr = msg.getMetaData().getValue(tlsKey);
+        String targetHost = TbNodeUtils.processPattern(hostKey, msg);
+        String portStr = TbNodeUtils.processPattern(portKey, msg);
+        String tlsStr = TbNodeUtils.processPattern(tlsKey, msg);
         boolean tls = "true".equalsIgnoreCase(tlsStr);
         int targetPort = 0;
         try {
@@ -64,13 +64,34 @@ public class TbSendToTcpNode implements TbNode {
             OutputStream out;
             Socket socket;
             if (tls) {
-                // Read TLS/PEM fields from metadata using keys from tlsConfig
-                String caPem = tlsConfig.getCaCertificateKey() != null ? msg.getMetaData().getValue(tlsConfig.getCaCertificateKey()) : null;
-                String certPem = tlsConfig.getCertificateKey() != null ? msg.getMetaData().getValue(tlsConfig.getCertificateKey()) : null;
-                String keyPem = tlsConfig.getPrivateKeyKey() != null ? msg.getMetaData().getValue(tlsConfig.getPrivateKeyKey()) : null;
-                String keyPassword = tlsConfig.getPrivateKeyPassphraseKey() != null ? msg.getMetaData().getValue(tlsConfig.getPrivateKeyPassphraseKey()) : null;
-                javax.net.ssl.SSLSocketFactory factory = createSSLSocketFactoryFromPem(caPem, certPem, keyPem, keyPassword);
+                javax.net.ssl.SSLSocketFactory factory;
+                // Read TLS/PEM fields from metadata or message using templatized keys from tlsConfig
+                String caPem = tlsConfig.getCaCertificateKey() != null ? TbNodeUtils.processPattern(tlsConfig.getCaCertificateKey(), msg) : null;
+                String certPem = tlsConfig.getCertificateKey() != null ? TbNodeUtils.processPattern(tlsConfig.getCertificateKey(), msg) : null;
+                String keyPem = tlsConfig.getPrivateKeyKey() != null ? TbNodeUtils.processPattern(tlsConfig.getPrivateKeyKey(), msg) : null;
+                String keyPassword = tlsConfig.getPrivateKeyPassphraseKey() != null ? TbNodeUtils.processPattern(tlsConfig.getPrivateKeyPassphraseKey(), msg) : null;
+                boolean verifyServerCert = tlsConfig.getVerifyServerCertificate() == null || tlsConfig.getVerifyServerCertificate();
+                factory = createSSLSocketFactoryFromPem(caPem, certPem, keyPem, keyPassword, verifyServerCert);
+                
                 socket = factory.createSocket(targetHost, targetPort);
+                // SNI and ALPN
+                if (socket instanceof javax.net.ssl.SSLSocket) {
+                    javax.net.ssl.SSLSocket sslSocket = (javax.net.ssl.SSLSocket) socket;
+                    String serverName = tlsConfig.getServerNameKey() != null ? TbNodeUtils.processPattern(tlsConfig.getServerNameKey(), msg) : null;
+                    if (serverName != null && !serverName.isEmpty()) {
+                        javax.net.ssl.SSLParameters params = sslSocket.getSSLParameters();
+                        params.setServerNames(java.util.Collections.singletonList(new javax.net.ssl.SNIHostName(serverName)));
+                        sslSocket.setSSLParameters(params);
+                    }
+                    String alpnProtocol = tlsConfig.getAlpnProtocolKey() != null ? TbNodeUtils.processPattern(tlsConfig.getAlpnProtocolKey(), msg) : null;
+                    if (alpnProtocol != null && !alpnProtocol.isEmpty()) {
+                        try {
+                            javax.net.ssl.SSLParameters params = sslSocket.getSSLParameters();
+                            params.setApplicationProtocols(new String[]{alpnProtocol});
+                            sslSocket.setSSLParameters(params);
+                        } catch (Throwable ignored) {}
+                    }
+                }
             } else {
                 socket = new Socket(targetHost, targetPort);
             }
@@ -85,7 +106,7 @@ public class TbSendToTcpNode implements TbNode {
     }
 
     // Helper: create SSLSocketFactory from PEM strings (CA, client cert, private key)
-    private javax.net.ssl.SSLSocketFactory createSSLSocketFactoryFromPem(String caPem, String certPem, String keyPem, String keyPassword) throws Exception {
+    private javax.net.ssl.SSLSocketFactory createSSLSocketFactoryFromPem(String caPem, String certPem, String keyPem, String keyPassword, boolean verifyServerCert) throws Exception {
         java.security.KeyStore trustStore = java.security.KeyStore.getInstance(java.security.KeyStore.getDefaultType());
         trustStore.load(null, null);
         if (caPem != null && !caPem.isEmpty()) {
@@ -96,6 +117,14 @@ public class TbSendToTcpNode implements TbNode {
         }
         javax.net.ssl.TrustManagerFactory tmf = javax.net.ssl.TrustManagerFactory.getInstance(javax.net.ssl.TrustManagerFactory.getDefaultAlgorithm());
         tmf.init(trustStore);
+        javax.net.ssl.TrustManager[] trustManagers = tmf.getTrustManagers();
+        if (!verifyServerCert) {
+            trustManagers = new javax.net.ssl.TrustManager[]{new javax.net.ssl.X509TrustManager() {
+                public java.security.cert.X509Certificate[] getAcceptedIssuers() { return new java.security.cert.X509Certificate[0]; }
+                public void checkClientTrusted(java.security.cert.X509Certificate[] certs, String authType) {}
+                public void checkServerTrusted(java.security.cert.X509Certificate[] certs, String authType) {}
+            }};
+        }
         javax.net.ssl.KeyManager[] kms = null;
         if (certPem != null && !certPem.isEmpty() && keyPem != null && !keyPem.isEmpty()) {
             java.security.KeyStore keyStore = java.security.KeyStore.getInstance(java.security.KeyStore.getDefaultType());
@@ -110,7 +139,7 @@ public class TbSendToTcpNode implements TbNode {
             kms = kmf.getKeyManagers();
         }
         javax.net.ssl.SSLContext ctx = javax.net.ssl.SSLContext.getInstance("TLS");
-        ctx.init(kms, tmf.getTrustManagers(), null);
+        ctx.init(kms, trustManagers, null);
         return ctx.getSocketFactory();
     }
 

@@ -27,13 +27,9 @@ public class TbSendToTcpNodeTest {
         node = new TbSendToTcpNode();
         ctx = mock(TbContext.class);
         TbSendToTcpNodeConfiguration config = new TbSendToTcpNodeConfiguration();
-        config.setHostKey("tcpHost");
-        config.setPortKey("tcpPort");
-        config.setTlsKey("tcpTls");
-        config.setTrustStorePathKey("caPem");
-        config.setTrustStorePasswordKey("keyPassword");
-        config.setKeyStorePathKey("certPem");
-        config.setKeyStorePasswordKey("keyPem");
+        config.setHostKey("${tcpHost}");
+        config.setPortKey("${tcpPort}");
+        config.setTlsKey("${tcpTls}");
         // Serialize config to JSON and use TbNodeUtils.convert to simulate production config
         ObjectMapper mapper = new ObjectMapper();
         JsonNode json = mapper.valueToTree(config);
@@ -49,6 +45,7 @@ public class TbSendToTcpNodeTest {
         metaData.putValue("tcpTls", "false");
         msg = mock(TbMsg.class);
         when(msg.getMetaData()).thenReturn(metaData);
+        when(msg.getData()).thenReturn("[\"test\"]");
         node.onMsg(ctx, msg);
         verify(ctx).tellFailure(eq(msg), any(IllegalArgumentException.class));
     }
@@ -59,6 +56,7 @@ public class TbSendToTcpNodeTest {
         metaData.putValue("tcpTls", "false");
         msg = mock(TbMsg.class);
         when(msg.getMetaData()).thenReturn(metaData);
+        when(msg.getData()).thenReturn("[\"test\"]");
         node.onMsg(ctx, msg);
         // Should fail with NullPointerException or similar
         verify(ctx).tellFailure(eq(msg), any(Exception.class));
@@ -70,6 +68,7 @@ public class TbSendToTcpNodeTest {
         metaData.putValue("tcpTls", "false");
         msg = mock(TbMsg.class);
         when(msg.getMetaData()).thenReturn(metaData);
+        when(msg.getData()).thenReturn("[\"test\"]");
         node.onMsg(ctx, msg);
         verify(ctx).tellFailure(eq(msg), any(Exception.class));
     }
@@ -81,7 +80,7 @@ public class TbSendToTcpNodeTest {
         metaData.putValue("tcpTls", "false");
         msg = mock(TbMsg.class);
         when(msg.getMetaData()).thenReturn(metaData);
-        when(msg.getData()).thenReturn("test");
+        when(msg.getData()).thenReturn("[\"test\"]");
         // Socket will fail to connect, but we want to verify the code path
         node.onMsg(ctx, msg);
         verify(ctx).tellFailure(eq(msg), any(Exception.class));
@@ -98,7 +97,7 @@ public class TbSendToTcpNodeTest {
         metaData.putValue("keyPassword", "");
         msg = mock(TbMsg.class);
         when(msg.getMetaData()).thenReturn(metaData);
-        when(msg.getData()).thenReturn("test");
+        when(msg.getData()).thenReturn("[\"test\"]");
         node.onMsg(ctx, msg);
         verify(ctx).tellFailure(eq(msg), any(Exception.class));
     }

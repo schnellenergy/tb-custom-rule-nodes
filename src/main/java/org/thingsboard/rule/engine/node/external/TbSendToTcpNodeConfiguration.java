@@ -5,25 +5,58 @@ import org.thingsboard.rule.engine.api.NodeConfiguration;
 
 @Data
 public class TbSendToTcpNodeConfiguration implements NodeConfiguration<TbSendToTcpNodeConfiguration> {
-    private String hostKey; // Metadata key for host
-    private String portKey; // Metadata key for port
-    private String tlsKey;  // Metadata key for TLS enable flag
-    private TlsConfig tlsConfig = new TlsConfig(); // Consolidated TLS config
-    // Legacy/optional fields for compatibility
-    private String trustStorePathKey;
-    private String trustStorePasswordKey;
-    private String keyStorePathKey;
-    private String keyStorePasswordKey;
+    /**
+     * Templatized key for the target host (e.g., "${metadata.tcpHost}").
+     */
+    private String hostKey;
+    /**
+     * Templatized key for the target port (e.g., "${metadata.tcpPort}").
+     */
+    private String portKey;
+    /**
+     * Templatized key for enabling TLS (e.g., "${metadata.tcpTls}").
+     * Should resolve to "true" or "false".
+     */
+    private String tlsKey;
 
+    /**
+     * TLS configuration (PEM or Keystore/Truststore, SNI, ALPN, etc).
+     */
+    private TlsConfig tlsConfig = new TlsConfig();
+
+    /**
+     * TLS configuration for PEM or Keystore/Truststore, SNI, ALPN, and verification options.
+     */
     @Data
     public static class TlsConfig {
-        private String certificateKey; // Metadata key for client certificate PEM
-        private String privateKeyKey; // Metadata key for private key PEM
-        private String privateKeyPassphraseKey; // Metadata key for private key passphrase
-        private String caCertificateKey; // Metadata key for CA certificate PEM
-        private Boolean verifyServerCertificate; // Whether to verify server cert
-        private String serverNameKey; // Metadata key for SNI/server name
-        private String alpnProtocolKey; // Metadata key for ALPN protocol
+        /**
+         * Templatized key for client certificate PEM (optional, for mutual TLS).
+         */
+        private String certificateKey;
+        /**
+         * Templatized key for private key PEM (optional, for mutual TLS).
+         */
+        private String privateKeyKey;
+        /**
+         * Templatized key for private key passphrase (optional).
+         */
+        private String privateKeyPassphraseKey;
+        /**
+         * Templatized key for CA certificate PEM (optional, for custom trust roots).
+         */
+        private String caCertificateKey;
+        /**
+         * Whether to verify the server certificate (default: true). If false, disables validation (INSECURE!).
+         */
+        private Boolean verifyServerCertificate;
+        /**
+         * Templatized key for SNI/server name (optional).
+         */
+        private String serverNameKey;
+        /**
+         * Templatized key for ALPN protocol (optional).
+         */
+        private String alpnProtocolKey;
     }
 
     @Override
@@ -41,10 +74,6 @@ public class TbSendToTcpNodeConfiguration implements NodeConfiguration<TbSendToT
         tls.setServerNameKey("tcpServerName");
         tls.setAlpnProtocolKey("tcpAlpnProtocol");
         config.setTlsConfig(tls);
-        config.setTrustStorePathKey(null);
-        config.setTrustStorePasswordKey(null);
-        config.setKeyStorePathKey(null);
-        config.setKeyStorePasswordKey(null);
         return config;
     }
 }
