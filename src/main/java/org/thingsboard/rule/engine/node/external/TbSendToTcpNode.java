@@ -25,7 +25,7 @@ import java.net.Socket;
     name = "tcp request",
     configClazz = TbSendToTcpNodeConfiguration.class,
     nodeDescription = "Send message data to a TCP endpoint. Target IP, port, and TLS/PEM secrets are provided via message metadata or message body using templatized keys.",
-    nodeDetails = "Reads target host, port, and TLS/PEM configuration from metadata or message using templatized keys (e.g., ${metadata.key}, ${msg.key}). Supports both plain TCP and TLS (with in-memory trust/key stores from PEM).",
+    nodeDetails = "Reads target host, port, and TLS/PEM configuration from metadata or message using templatized keys (e.g., ${key}, $[key]). Supports both plain TCP and TLS (with in-memory trust/key stores from PEM).",
     uiResources = {"static/rulenode/custom-nodes-config.js"},
     configDirective = "tbExternalNodeSendToTcpConfig",
     icon = "call_made"
@@ -37,21 +37,32 @@ public class TbSendToTcpNode implements TbNode {
     private String portKey;
     private String tlsKey;
     private TbSendToTcpNodeConfiguration.TlsConfig tlsConfig;
+    private String payloadType;
+    private String responseType;
 
     @Override
     public void init(TbContext ctx, TbNodeConfiguration configuration) throws TbNodeException {
         this.config = TbNodeUtils.convert(configuration, TbSendToTcpNodeConfiguration.class);
-        hostKey = config.getHostKey();
-        portKey = config.getPortKey();
-        tlsKey = config.getTlsKey();
+        hostKey = config.getHostKey() != null ? config.getHostKey() : "${tcpHost}";
+        portKey = config.getPortKey() != null ? config.getPortKey() : "${tcpPort}";
+        tlsKey = config.getTlsKey() != null ? config.getTlsKey() : "${tcpTls}";
         tlsConfig = config.getTlsConfig();
+        payloadType = config.getPayloadType() != null ? config.getPayloadType() : "STRING";
+        responseType = config.getResponseType() != null ? config.getResponseType() : "STRING";
     }
 
     @Override
     public void onMsg(TbContext ctx, TbMsg msg) {
-        String targetHost = TbNodeUtils.processPattern(hostKey, msg);
-        String portStr = TbNodeUtils.processPattern(portKey, msg);
-        String tlsStr = TbNodeUtils.processPattern(tlsKey, msg);
+        String targetHost, portStr, tlsStr;
+        try {
+            
+            targetHost = TbNodeUtils.processPattern(hostKey, msg);
+            portStr = TbNodeUtils.processPattern(portKey, msg);
+            tlsStr = TbNodeUtils.processPattern(tlsKey, msg);
+        } catch (IllegalArgumentException iae) {
+            ctx.tellFailure(msg, new IllegalArgumentException("Failed to process pattern for host/port/tls: " + iae.getMessage(), iae));
+            return;
+        }
         boolean tls = "true".equalsIgnoreCase(tlsStr);
         int targetPort = 0;
         try {
@@ -61,45 +72,45 @@ public class TbSendToTcpNode implements TbNode {
             return;
         }
         try {
-            OutputStream out;
-            Socket socket;
+            javax.net.ssl.SSLSocketFactory sslFactory = null;
             if (tls) {
-                javax.net.ssl.SSLSocketFactory factory;
-                // Read TLS/PEM fields from metadata or message using templatized keys from tlsConfig
                 String caPem = tlsConfig.getCaCertificateKey() != null ? TbNodeUtils.processPattern(tlsConfig.getCaCertificateKey(), msg) : null;
                 String certPem = tlsConfig.getCertificateKey() != null ? TbNodeUtils.processPattern(tlsConfig.getCertificateKey(), msg) : null;
                 String keyPem = tlsConfig.getPrivateKeyKey() != null ? TbNodeUtils.processPattern(tlsConfig.getPrivateKeyKey(), msg) : null;
                 String keyPassword = tlsConfig.getPrivateKeyPassphraseKey() != null ? TbNodeUtils.processPattern(tlsConfig.getPrivateKeyPassphraseKey(), msg) : null;
                 boolean verifyServerCert = tlsConfig.getVerifyServerCertificate() == null || tlsConfig.getVerifyServerCertificate();
-                factory = createSSLSocketFactoryFromPem(caPem, certPem, keyPem, keyPassword, verifyServerCert);
-                
-                socket = factory.createSocket(targetHost, targetPort);
-                // SNI and ALPN
-                if (socket instanceof javax.net.ssl.SSLSocket) {
-                    javax.net.ssl.SSLSocket sslSocket = (javax.net.ssl.SSLSocket) socket;
-                    String serverName = tlsConfig.getServerNameKey() != null ? TbNodeUtils.processPattern(tlsConfig.getServerNameKey(), msg) : null;
-                    if (serverName != null && !serverName.isEmpty()) {
-                        javax.net.ssl.SSLParameters params = sslSocket.getSSLParameters();
-                        params.setServerNames(java.util.Collections.singletonList(new javax.net.ssl.SNIHostName(serverName)));
-                        sslSocket.setSSLParameters(params);
-                    }
-                    String alpnProtocol = tlsConfig.getAlpnProtocolKey() != null ? TbNodeUtils.processPattern(tlsConfig.getAlpnProtocolKey(), msg) : null;
-                    if (alpnProtocol != null && !alpnProtocol.isEmpty()) {
-                        try {
-                            javax.net.ssl.SSLParameters params = sslSocket.getSSLParameters();
-                            params.setApplicationProtocols(new String[]{alpnProtocol});
-                            sslSocket.setSSLParameters(params);
-                        } catch (Throwable ignored) {}
+                sslFactory = createSSLSocketFactoryFromPem(caPem, certPem, keyPem, keyPassword, verifyServerCert);
+            }
+            TbTcpClient.PayloadType pt = TbTcpClient.PayloadType.valueOf(payloadType.toUpperCase());
+            TbTcpClient.PayloadType rt = TbTcpClient.PayloadType.valueOf(responseType.toUpperCase());
+            TbTcpClient client = new TbTcpClient(targetHost, targetPort, tls, sslFactory, 5000, 5000);
+            byte[] payloadBytes;
+            if (pt == TbTcpClient.PayloadType.BINARY) {
+                payloadBytes = java.util.Base64.getDecoder().decode(msg.getData());
+            } else {
+                if (pt == TbTcpClient.PayloadType.JSON) {
+                    try {
+                        new com.fasterxml.jackson.databind.ObjectMapper().readTree(msg.getData());
+                    } catch (Exception e) {
+                        ctx.tellFailure(msg, new IllegalArgumentException("Payload is not valid JSON: " + e.getMessage()));
+                        return;
                     }
                 }
-            } else {
-                socket = new Socket(targetHost, targetPort);
+                payloadBytes = msg.getData().getBytes(java.nio.charset.StandardCharsets.UTF_8);
             }
-            out = socket.getOutputStream();
-            out.write(msg.getData().getBytes());
-            out.flush();
-            socket.close();
-            ctx.tellNext(msg, TbNodeConnectionType.SUCCESS);
+            byte[] responseBytes = client.sendAndReceive(payloadBytes);
+            String decodedResponse = client.decodeResponse(responseBytes, rt);
+            // Copy metadata and add tcpResponse
+            org.thingsboard.server.common.msg.TbMsgMetaData newMd = new org.thingsboard.server.common.msg.TbMsgMetaData();
+            msg.getMetaData().getData().forEach(newMd::putValue);
+            newMd.putValue("tcpResponse", decodedResponse);
+            TbMsg outMsg = TbMsg.builder()
+                .type(msg.getType())
+                .originator(msg.getOriginator())
+                .metaData(newMd)
+                .data(msg.getData())
+                .build();
+            ctx.tellNext(outMsg, TbNodeConnectionType.SUCCESS);
         } catch (Exception e) {
             ctx.tellFailure(msg, e);
         }

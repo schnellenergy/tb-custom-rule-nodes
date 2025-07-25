@@ -20,6 +20,15 @@ public class TbSendToTcpNodeConfiguration implements NodeConfiguration<TbSendToT
     private String tlsKey;
 
     /**
+     * Payload type: STRING, JSON, BINARY
+     */
+    private String payloadType; // STRING, JSON, BINARY
+    /**
+     * Response type: STRING, JSON, BINARY
+     */
+    private String responseType; // STRING, JSON, BINARY
+
+    /**
      * TLS configuration (PEM or Keystore/Truststore, SNI, ALPN, etc).
      */
     private TlsConfig tlsConfig = new TlsConfig();
@@ -62,9 +71,11 @@ public class TbSendToTcpNodeConfiguration implements NodeConfiguration<TbSendToT
     @Override
     public TbSendToTcpNodeConfiguration defaultConfiguration() {
         TbSendToTcpNodeConfiguration config = new TbSendToTcpNodeConfiguration();
-        config.setHostKey("tcpHost");
-        config.setPortKey("tcpPort");
-        config.setTlsKey("tcpTls");
+        config.setHostKey("${metadata.tcpHost}");
+        config.setPortKey("${metadata.tcpPort}");
+        config.setTlsKey("${metadata.tcpTls}");
+        config.setPayloadType("STRING");
+        config.setResponseType("STRING");
         TlsConfig tls = new TlsConfig();
         tls.setCertificateKey("tcpClientCert");
         tls.setPrivateKeyKey("tcpClientKey");
