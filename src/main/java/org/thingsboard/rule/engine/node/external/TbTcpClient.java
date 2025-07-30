@@ -15,7 +15,7 @@ import java.nio.charset.StandardCharsets;
  * Inspired by TbHttpClient, but for TCP/TLS connections.
  */
 public class TbTcpClient {
-    public enum PayloadType { STRING, JSON, BINARY }
+    // All encoding/decoding now uses TbMsgDataType directly
 
     private final String host;
     private final int port;
@@ -66,27 +66,36 @@ public class TbTcpClient {
     }
 
     /**
-     * Sends a string payload and returns the response as a string.
+     * Sends a string payload and returns the response as a string using TbMsgDataType.
      */
-    public String sendAndReceive(String payload, PayloadType payloadType) throws IOException {
+    public byte[] sendAndReceive(String payload, org.thingsboard.server.common.msg.TbMsgDataType dataType) throws IOException {
         byte[] payloadBytes;
-        if (payloadType == PayloadType.BINARY) {
+        if (dataType == null || "TEXT".equalsIgnoreCase(dataType.name())) {
+            payloadBytes = payload.getBytes(StandardCharsets.UTF_8);
+        } else if ("BINARY".equalsIgnoreCase(dataType.name())) {
             payloadBytes = java.util.Base64.getDecoder().decode(payload);
+        } else if ("JSON".equalsIgnoreCase(dataType.name())) {
+            payloadBytes = payload.getBytes(StandardCharsets.UTF_8);
         } else {
             payloadBytes = payload.getBytes(StandardCharsets.UTF_8);
         }
         byte[] response = sendAndReceive(payloadBytes);
-        return decodeResponse(response, payloadType);
+        return response;
     }
 
     /**
-     * Decodes the response bytes according to the payload type.
+     * Decodes the response bytes according to the TbMsgDataType.
      */
-    public String decodeResponse(byte[] response, PayloadType payloadType) {
-        if (payloadType == PayloadType.BINARY) {
+    public String decodeResponse(byte[] response, org.thingsboard.server.common.msg.TbMsgDataType dataType) {
+        if (dataType == null || "TEXT".equalsIgnoreCase(dataType.name())) {
+            return new String(response, StandardCharsets.UTF_8);
+        } else if ("BINARY".equalsIgnoreCase(dataType.name())) {
             return java.util.Base64.getEncoder().encodeToString(response);
+        } else if ("JSON".equalsIgnoreCase(dataType.name())) {
+            return new String(response, StandardCharsets.UTF_8);
         } else {
             return new String(response, StandardCharsets.UTF_8);
         }
     }
 }
+// ...existing code...

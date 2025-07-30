@@ -1,5 +1,7 @@
 package org.thingsboard.rule.engine.node.external;
 
+import java.util.UUID;
+
 import org.thingsboard.rule.engine.api.RuleNode;
 import org.thingsboard.rule.engine.api.TbContext;
 import org.thingsboard.rule.engine.api.TbNode;
@@ -12,9 +14,6 @@ import org.thingsboard.server.common.msg.TbMsg;
 
 import lombok.extern.slf4j.Slf4j;
 
-import java.io.OutputStream;
-import java.net.Socket;
-
 /**
  * Sends data to a TCP endpoint with dynamic TLS/PEM configuration from metadata.
  * Created by Kalaivanan S on 11-July-2025.
@@ -22,10 +21,10 @@ import java.net.Socket;
 @Slf4j
 @RuleNode(
     type = ComponentType.EXTERNAL,
-    name = "tcp request",
+    name = "tcp request v0.1",
     configClazz = TbSendToTcpNodeConfiguration.class,
-    nodeDescription = "Send message data to a TCP endpoint. Target IP, port, and TLS/PEM secrets are provided via message metadata or message body using templatized keys.",
-    nodeDetails = "Reads target host, port, and TLS/PEM configuration from metadata or message using templatized keys (e.g., ${key}, $[key]). Supports both plain TCP and TLS (with in-memory trust/key stores from PEM).",
+    nodeDescription = "Send message data to a TCP endpoint. Payload data type can be one of TEXT, JSON or BINARY.",
+    nodeDetails = "Reads target host, port, and TLS/PEM configuration from metadata or message using templatized keys <code>${metadata_key}</code>, <code>$[message_key]</code>. The message data must contain a <code>payload</code> key (e.g., <code>{\"payload\":...}</code). The value of 'payload' is sent as the TCP payload. Supports both plain TCP and TLS (with trust credentials shall be passed as part of the message data or metadata).",
     uiResources = {"static/rulenode/custom-nodes-config.js"},
     configDirective = "tbExternalNodeSendToTcpConfig",
     icon = "call_made"
@@ -55,11 +54,11 @@ public class TbSendToTcpNode implements TbNode {
     public void onMsg(TbContext ctx, TbMsg msg) {
         String targetHost, portStr, tlsStr;
         try {
-            
             targetHost = TbNodeUtils.processPattern(hostKey, msg);
             portStr = TbNodeUtils.processPattern(portKey, msg);
             tlsStr = TbNodeUtils.processPattern(tlsKey, msg);
         } catch (IllegalArgumentException iae) {
+            log.error("Failed to process pattern for host/port/tls", iae);
             ctx.tellFailure(msg, new IllegalArgumentException("Failed to process pattern for host/port/tls: " + iae.getMessage(), iae));
             return;
         }
@@ -68,6 +67,7 @@ public class TbSendToTcpNode implements TbNode {
         try {
             targetPort = Integer.parseInt(portStr);
         } catch (Exception e) {
+            log.error("Message doesn't contain a valid port: {}", portStr);
             ctx.tellFailure(msg, new IllegalArgumentException("Message doesn't contain a valid port: " + portStr));
             return;
         }
@@ -81,37 +81,51 @@ public class TbSendToTcpNode implements TbNode {
                 boolean verifyServerCert = tlsConfig.getVerifyServerCertificate() == null || tlsConfig.getVerifyServerCertificate();
                 sslFactory = createSSLSocketFactoryFromPem(caPem, certPem, keyPem, keyPassword, verifyServerCert);
             }
-            TbTcpClient.PayloadType pt = TbTcpClient.PayloadType.valueOf(payloadType.toUpperCase());
-            TbTcpClient.PayloadType rt = TbTcpClient.PayloadType.valueOf(responseType.toUpperCase());
-            TbTcpClient client = new TbTcpClient(targetHost, targetPort, tls, sslFactory, 5000, 5000);
-            byte[] payloadBytes;
-            if (pt == TbTcpClient.PayloadType.BINARY) {
-                payloadBytes = java.util.Base64.getDecoder().decode(msg.getData());
-            } else {
-                if (pt == TbTcpClient.PayloadType.JSON) {
-                    try {
-                        new com.fasterxml.jackson.databind.ObjectMapper().readTree(msg.getData());
-                    } catch (Exception e) {
-                        ctx.tellFailure(msg, new IllegalArgumentException("Payload is not valid JSON: " + e.getMessage()));
-                        return;
-                    }
+            org.thingsboard.server.common.msg.TbMsgDataType pt = msg.getDataType() != null ? msg.getDataType() : org.thingsboard.server.common.msg.TbMsgDataType.valueOf(payloadType.toUpperCase());
+            org.thingsboard.server.common.msg.TbMsgDataType rt = org.thingsboard.server.common.msg.TbMsgDataType.valueOf(responseType.toUpperCase());
+            TbTcpClient client = new TbTcpClient(targetHost, targetPort, tls, sslFactory, 10000, 10000);
+            String payload = null;
+            try {
+                com.fasterxml.jackson.databind.JsonNode dataNode = com.fasterxml.jackson.databind.node.NullNode.getInstance();
+                if (msg.getData() != null && !msg.getData().isEmpty()) {
+                    dataNode = new com.fasterxml.jackson.databind.ObjectMapper().readTree(msg.getData());
                 }
-                payloadBytes = msg.getData().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                if (dataNode.has("payload")) {
+                    payload = dataNode.get("payload").asText();
+                }
+            } catch (Exception ex) {
+                log.error("Failed to parse message data for 'payload' key", ex);
+                ctx.tellFailure(msg, new IllegalArgumentException("Failed to parse message data for 'payload' key: " + ex.getMessage()));
+                return;
             }
-            byte[] responseBytes = client.sendAndReceive(payloadBytes);
-            String decodedResponse = client.decodeResponse(responseBytes, rt);
+            if (payload == null) {
+                log.error("No 'payload' key found in msg data");
+                ctx.tellFailure(msg, new IllegalArgumentException("No 'payload' key found in msg data"));
+                return;
+            }
+            byte[] response;
+            try {
+                response = client.sendAndReceive(payload, pt);
+            } catch (IllegalArgumentException e) {
+                log.error("Failed to encode payload: {}", payload, e);
+                ctx.tellFailure(msg, new IllegalArgumentException("Payload is not valid for type " + pt + ": " + e.getMessage()));
+                return;
+            }
+            log.debug("Received TCP response: {}", response);
             // Copy metadata and add tcpResponse
             org.thingsboard.server.common.msg.TbMsgMetaData newMd = new org.thingsboard.server.common.msg.TbMsgMetaData();
             msg.getMetaData().getData().forEach(newMd::putValue);
-            newMd.putValue("tcpResponse", decodedResponse);
             TbMsg outMsg = TbMsg.builder()
-                .type(msg.getType())
+                .type("TCP_RESPONSE")
                 .originator(msg.getOriginator())
                 .metaData(newMd)
-                .data(msg.getData())
+                .data(client.decodeResponse(response, rt))
+                .dataType(rt)
+                .id(new UUID(targetPort, msg.getTs()))
                 .build();
             ctx.tellNext(outMsg, TbNodeConnectionType.SUCCESS);
         } catch (Exception e) {
+            log.error("TCP node failed to process message", e);
             ctx.tellFailure(msg, e);
         }
     }

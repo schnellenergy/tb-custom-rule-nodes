@@ -1,3 +1,4 @@
+
 package org.thingsboard.rule.engine.node.external;
 
 import lombok.Data;
@@ -6,15 +7,15 @@ import org.thingsboard.rule.engine.api.NodeConfiguration;
 @Data
 public class TbSendToTcpNodeConfiguration implements NodeConfiguration<TbSendToTcpNodeConfiguration> {
     /**
-     * Templatized key for the target host (e.g., "${metadata.tcpHost}").
+     * Templatized key for the target host (e.g., "${tcpHost}" or "$[tcpHost]").
      */
     private String hostKey;
     /**
-     * Templatized key for the target port (e.g., "${metadata.tcpPort}").
+     * Templatized key for the target port (e.g., "${tcpPort}" or "$[tcpPort]").
      */
     private String portKey;
     /**
-     * Templatized key for enabling TLS (e.g., "${metadata.tcpTls}").
+     * Templatized key for enabling TLS (e.g., "${tcpTls}" or "$[tcpTls]").
      * Should resolve to "true" or "false".
      */
     private String tlsKey;
@@ -71,19 +72,10 @@ public class TbSendToTcpNodeConfiguration implements NodeConfiguration<TbSendToT
     @Override
     public TbSendToTcpNodeConfiguration defaultConfiguration() {
         TbSendToTcpNodeConfiguration config = new TbSendToTcpNodeConfiguration();
-        config.setHostKey("${metadata.tcpHost}");
-        config.setPortKey("${metadata.tcpPort}");
-        config.setTlsKey("${metadata.tcpTls}");
-        config.setPayloadType("STRING");
-        config.setResponseType("STRING");
+        config.setPayloadType("TEXT");
+        config.setResponseType("TEXT");
         TlsConfig tls = new TlsConfig();
-        tls.setCertificateKey("tcpClientCert");
-        tls.setPrivateKeyKey("tcpClientKey");
-        tls.setPrivateKeyPassphraseKey("tcpClientKeyPassphrase");
-        tls.setCaCertificateKey("tcpCaCert");
-        tls.setVerifyServerCertificate(true);
-        tls.setServerNameKey("tcpServerName");
-        tls.setAlpnProtocolKey("tcpAlpnProtocol");
+        tls.setVerifyServerCertificate(false);
         config.setTlsConfig(tls);
         return config;
     }

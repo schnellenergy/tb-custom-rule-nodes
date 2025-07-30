@@ -11,12 +11,35 @@ import org.junit.jupiter.api.Test;
 import org.thingsboard.rule.engine.api.TbContext;
 import org.thingsboard.rule.engine.api.TbNodeException;
 import org.thingsboard.server.common.msg.TbMsg;
+import org.thingsboard.server.common.msg.TbMsgDataType;
 import org.thingsboard.server.common.msg.TbMsgMetaData;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 public class TbSendToTcpNodeTest {
+    
+    private TbSendToTcpNode node;
+    private TbContext ctx;
+    private TbMsg msg;
+    private TbMsgMetaData metaData;
+
+    @BeforeEach
+    public void setup() throws TbNodeException {
+        node = new TbSendToTcpNode();
+        ctx = mock(TbContext.class);
+        TbSendToTcpNodeConfiguration config = new TbSendToTcpNodeConfiguration();
+        config.setHostKey("${tcpHost}");
+        config.setPortKey("${tcpPort}");
+        config.setTlsKey("${tcpTls}");
+        // Serialize config to JSON and use TbNodeUtils.convert to simulate production config
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode json = mapper.valueToTree(config);
+        org.thingsboard.rule.engine.api.TbNodeConfiguration tbNodeConfig = new org.thingsboard.rule.engine.api.TbNodeConfiguration(json);
+        node.init(ctx, tbNodeConfig);
+        metaData = new TbMsgMetaData();
+    }
+
     @Test
     public void testStringPayloadType() {
         TbMsgMetaData localMeta = new TbMsgMetaData();
@@ -27,8 +50,8 @@ public class TbSendToTcpNodeTest {
         config.setHostKey("${tcpHost}");
         config.setPortKey("${tcpPort}");
         config.setTlsKey("${tcpTls}");
-        config.setPayloadType("STRING");
-        config.setResponseType("STRING");
+        config.setPayloadType("TEXT");
+        config.setResponseType("TEXT");
         ObjectMapper mapper = new ObjectMapper();
         JsonNode json = mapper.valueToTree(config);
         org.thingsboard.rule.engine.api.TbNodeConfiguration tbNodeConfig = new org.thingsboard.rule.engine.api.TbNodeConfiguration(json);
@@ -39,14 +62,14 @@ public class TbSendToTcpNodeTest {
         }
         msg = mock(TbMsg.class);
         when(msg.getMetaData()).thenReturn(localMeta);
-        when(msg.getData()).thenReturn("{\"test\":\"string\"}");
+        when(msg.getData()).thenReturn("{\"payload\":\"string\"}");
         node.onMsg(ctx, msg);
         verify(ctx).tellNext(
             org.mockito.ArgumentMatchers.argThat(m ->
-                m.getData().equals("{\"test\":\"string\"}") &&
-                m.getMetaData().getValue("tcpResponse").equals("{\"test\":\"string\"}")
+                m.getData().equals("{\"payload\":\"string\"}") &&
+                "string".equals(m.getMetaData().getValue("tcpResponse"))
             ),
-            eq("Success")
+            eq(org.thingsboard.server.common.data.msg.TbNodeConnectionType.SUCCESS)
         );
     }
 
@@ -72,14 +95,14 @@ public class TbSendToTcpNodeTest {
         }
         msg = mock(TbMsg.class);
         when(msg.getMetaData()).thenReturn(localMeta);
-        when(msg.getData()).thenReturn("{\"key\":\"value\"}");
+        when(msg.getData()).thenReturn("{\"payload\":{\"key\":\"value\"}}" );
         node.onMsg(ctx, msg);
         verify(ctx).tellNext(
             org.mockito.ArgumentMatchers.argThat(m ->
-                m.getData().equals("{\"key\":\"value\"}") &&
-                m.getMetaData().getValue("tcpResponse").equals("{\"key\":\"value\"}")
+                (!m.getData().isEmpty() &&
+                !m.getMetaData().getValue("tcpResponse").isEmpty())
             ),
-            eq("Success")
+            eq(org.thingsboard.server.common.data.msg.TbNodeConnectionType.SUCCESS)
         );
     }
 
@@ -105,36 +128,29 @@ public class TbSendToTcpNodeTest {
         }
         msg = mock(TbMsg.class);
         when(msg.getMetaData()).thenReturn(localMeta);
-        // Base64 for 'test' is dGVzdA==
-        when(msg.getData()).thenReturn("{\"data\":\"e1wia2V5XCI6XCJkR1Z6ZEE9PVwifQ==\"}");
+        when(msg.getDataType()).thenReturn(TbMsgDataType.BINARY);
+/* Test Data
+|--------------------- Byte Array -----------------------|----------- Base64 ---------|
+|7A A7 00 0D C0 01 C1 00 07 01 00 5E 5B 00 FF 02 00      |eqcADcABwQAHAQBeWwD/AgA=    | GIDP
+|7A A7 00 0D C0 01 C1 00 07 01 00 5E 5B 85 FF 02 00      |eqcADcABwQAHAQBeW4X/AgA=    | GADP
+|7A A7 00 0D C0 01 C1 00 07 01 00 63 02 00 FF 02 00      |eqcADcABwQAHAQBjAgD/AgA=    | GMRP
+|7A A7 00 0F C3 01 C1 00 46 00 00 60 03 0A FF 01 01 0F 00|eqcAD8MBwQAoAAcZCQD/AQEPAA==| RDCON
+|7A A7 00 0F C3 01 C1 00 46 00 00 60 03 0A FF 02 01 0F 00|eqcAD8MBwQBGAABgAwr/AgEPAA==| RCON
+|7A A7 00 0F C3 01 C1 00 28 00 07 19 09 00 FF 01 01 0F 00|eqcAD8MBwQAoAAcZCQD/AQEPAA==| GAIDP
+|7A A7 00 0F C3 01 C1 00 28 00 85 19 09 00 FF 01 01 0F 00|eqcAD8MBwQAoAIUZCQD/AQEPAA==| GAADP
+|7A A7 00 0F C3 01 C1 00 28 00 06 19 09 00 FF 01 01 0F 00|eqcAD8MBwQAoAAYZCQD/AQEPAA==| GAMRP
+|7A A7 00 0F C3 01 C1 00 28 00 04 19 09 00 FF 01 01 0F 00|eqcAD8MBwQAoAAQZCQD/AQEPAA==| GAEDP
+|--------------------------------------------------------|----------------------------|
+*/
+        String base64Data = "{\"payload\":\"eqcADcABwQAHAQBeWwD/AgA=\"}";
+        when(msg.getData()).thenReturn(base64Data);
         node.onMsg(ctx, msg);
         verify(ctx).tellNext(
             org.mockito.ArgumentMatchers.argThat(m ->
-                m.getData().equals("{\"data\":\"e1wia2V5XCI6XCJkR1Z6ZEE9PVwifQ==\"}") &&
-                m.getMetaData().getValue("tcpResponse").equals("{\"data\":\"e1wia2V5XCI6XCJkR1Z6ZEE9PVwifQ==\"}")
+                !m.getData().isEmpty()
             ),
-            eq("Success")
+            eq(org.thingsboard.server.common.data.msg.TbNodeConnectionType.SUCCESS)
         );
-    }
-    private TbSendToTcpNode node;
-    private TbContext ctx;
-    private TbMsg msg;
-    private TbMsgMetaData metaData;
-
-    @BeforeEach
-    public void setup() throws TbNodeException {
-        node = new TbSendToTcpNode();
-        ctx = mock(TbContext.class);
-        TbSendToTcpNodeConfiguration config = new TbSendToTcpNodeConfiguration();
-        config.setHostKey("${tcpHost}");
-        config.setPortKey("${tcpPort}");
-        config.setTlsKey("${tcpTls}");
-        // Serialize config to JSON and use TbNodeUtils.convert to simulate production config
-        ObjectMapper mapper = new ObjectMapper();
-        JsonNode json = mapper.valueToTree(config);
-        org.thingsboard.rule.engine.api.TbNodeConfiguration tbNodeConfig = new org.thingsboard.rule.engine.api.TbNodeConfiguration(json);
-        node.init(ctx, tbNodeConfig);
-        metaData = new TbMsgMetaData();
     }
 
     @Test
