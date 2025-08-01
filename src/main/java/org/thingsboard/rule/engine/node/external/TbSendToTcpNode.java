@@ -81,7 +81,7 @@ public class TbSendToTcpNode implements TbNode {
                 boolean verifyServerCert = tlsConfig.getVerifyServerCertificate() == null || tlsConfig.getVerifyServerCertificate();
                 sslFactory = createSSLSocketFactoryFromPem(caPem, certPem, keyPem, keyPassword, verifyServerCert);
             }
-            org.thingsboard.server.common.msg.TbMsgDataType pt = msg.getDataType() != null ? msg.getDataType() : org.thingsboard.server.common.msg.TbMsgDataType.valueOf(payloadType.toUpperCase());
+            org.thingsboard.server.common.msg.TbMsgDataType pt = org.thingsboard.server.common.msg.TbMsgDataType.valueOf(payloadType.toUpperCase());
             org.thingsboard.server.common.msg.TbMsgDataType rt = org.thingsboard.server.common.msg.TbMsgDataType.valueOf(responseType.toUpperCase());
             TbTcpClient client = new TbTcpClient(targetHost, targetPort, tls, sslFactory, 10000, 10000);
             String payload = null;
