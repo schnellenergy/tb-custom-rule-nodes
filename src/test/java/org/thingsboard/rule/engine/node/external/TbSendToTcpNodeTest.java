@@ -1,3 +1,18 @@
+/**
+ * Copyright © 2018-2025 The Thingsboard Authors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package org.thingsboard.rule.engine.node.external;
 
 import static org.mockito.ArgumentMatchers.any;
@@ -20,7 +35,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 public class TbSendToTcpNodeTest {
-    
+
     private TbSendToTcpNode node;
     private TbContext ctx;
     private TbMsg msg;
@@ -33,11 +48,13 @@ public class TbSendToTcpNodeTest {
         TbSendToTcpNodeConfiguration config = new TbSendToTcpNodeConfiguration();
         config.setHostKey("${tcpHost}");
         config.setPortKey("${tcpPort}");
-        config.setTlsKey("${tcpTls}");
-        // Serialize config to JSON and use TbNodeUtils.convert to simulate production config
+        config.setTls(false);
+        // Serialize config to JSON and use TbNodeUtils.convert to simulate production
+        // config
         ObjectMapper mapper = new ObjectMapper();
         JsonNode json = mapper.valueToTree(config);
-        org.thingsboard.rule.engine.api.TbNodeConfiguration tbNodeConfig = new org.thingsboard.rule.engine.api.TbNodeConfiguration(json);
+        org.thingsboard.rule.engine.api.TbNodeConfiguration tbNodeConfig = new org.thingsboard.rule.engine.api.TbNodeConfiguration(
+                json);
         node.init(ctx, tbNodeConfig);
         metaData = new TbMsgMetaData();
     }
@@ -49,42 +66,44 @@ public class TbSendToTcpNodeTest {
         try {
             TbTcpClient mockClient = mock(TbTcpClient.class);
             try {
-                when(mockClient.sendRequest(org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
+                when(mockClient.sendRequest(org.mockito.ArgumentMatchers.anyString(),
+                        org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
                         .thenReturn("{\"response\":\"string\"}");
-            } catch (java.io.IOException ignored) {}
-            TbSendToTcpNode.clientFactory = (h,p,t,ssl,ct,rt) -> mockClient;
-            
+            } catch (java.io.IOException ignored) {
+            }
+            TbSendToTcpNode.clientFactory = (h, p, t, ssl, ct, rt) -> mockClient;
+
             TbMsgMetaData localMeta = new TbMsgMetaData();
             localMeta.putValue("tcpHost", "3.109.15.103");
             localMeta.putValue("tcpPort", "10550");
-            localMeta.putValue("tcpTls", "false");
             TbSendToTcpNodeConfiguration config = new TbSendToTcpNodeConfiguration();
             config.setHostKey("${tcpHost}");
             config.setPortKey("${tcpPort}");
-            config.setTlsKey("${tcpTls}");
+            config.setTls(false);
             config.setPayloadType("TEXT");
             config.setResponseType("TEXT");
             ObjectMapper mapper = new ObjectMapper();
             JsonNode json = mapper.valueToTree(config);
-            org.thingsboard.rule.engine.api.TbNodeConfiguration tbNodeConfig = new org.thingsboard.rule.engine.api.TbNodeConfiguration(json);
+            org.thingsboard.rule.engine.api.TbNodeConfiguration tbNodeConfig = new org.thingsboard.rule.engine.api.TbNodeConfiguration(
+                    json);
             try {
                 node.init(ctx, tbNodeConfig);
             } catch (org.thingsboard.rule.engine.api.TbNodeException e) {
                 org.junit.jupiter.api.Assertions.fail("TbNodeException during init: " + e.getMessage());
             }
             msg = TbMsg.newMsg().data("{\"payload\":\"string\"}").metaData(
-                localMeta).originator(new DeviceId(UUID.randomUUID())).build();
+                    localMeta).originator(new DeviceId(UUID.randomUUID())).build();
             node.onMsg(ctx, msg);
             verify(ctx).tellSuccess(
-                org.mockito.ArgumentMatchers.argThat(m -> {
-                    try {
-                        com.fasterxml.jackson.databind.JsonNode node = new com.fasterxml.jackson.databind.ObjectMapper().readTree(m.getData());
-                        return node.has("response") && "string".equals(node.get("response").asText());
-                    } catch (Exception e) {
-                        return false;
-                    }
-                })
-            );
+                    org.mockito.ArgumentMatchers.argThat(m -> {
+                        try {
+                            com.fasterxml.jackson.databind.JsonNode node = new com.fasterxml.jackson.databind.ObjectMapper()
+                                    .readTree(m.getData());
+                            return node.has("response") && "string".equals(node.get("response").asText());
+                        } catch (Exception e) {
+                            return false;
+                        }
+                    }));
         } finally {
             TbSendToTcpNode.clientFactory = originalFactory;
         }
@@ -96,43 +115,45 @@ public class TbSendToTcpNodeTest {
         try {
             TbTcpClient mockClient = mock(TbTcpClient.class);
             try {
-                when(mockClient.sendRequest(org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
+                when(mockClient.sendRequest(org.mockito.ArgumentMatchers.anyString(),
+                        org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
                         .thenReturn("{\"response\":{\"key\":\"value\"}}");
-            } catch (java.io.IOException ignored) {}
-            TbSendToTcpNode.clientFactory = (h,p,t,ssl,ct,rt) -> mockClient;
-            
+            } catch (java.io.IOException ignored) {
+            }
+            TbSendToTcpNode.clientFactory = (h, p, t, ssl, ct, rt) -> mockClient;
+
             TbMsgMetaData localMeta = new TbMsgMetaData();
             localMeta.putValue("tcpHost", "3.109.15.103");
             localMeta.putValue("tcpPort", "10550");
-            localMeta.putValue("tcpTls", "false");
             TbSendToTcpNodeConfiguration config = new TbSendToTcpNodeConfiguration();
             config.setHostKey("${tcpHost}");
             config.setPortKey("${tcpPort}");
-            config.setTlsKey("${tcpTls}");
+            config.setTls(false);
             config.setPayloadType("JSON");
             config.setResponseType("JSON");
             ObjectMapper mapper = new ObjectMapper();
             JsonNode json = mapper.valueToTree(config);
-            org.thingsboard.rule.engine.api.TbNodeConfiguration tbNodeConfig = new org.thingsboard.rule.engine.api.TbNodeConfiguration(json);
+            org.thingsboard.rule.engine.api.TbNodeConfiguration tbNodeConfig = new org.thingsboard.rule.engine.api.TbNodeConfiguration(
+                    json);
             try {
                 node.init(ctx, tbNodeConfig);
             } catch (org.thingsboard.rule.engine.api.TbNodeException e) {
                 org.junit.jupiter.api.Assertions.fail("TbNodeException during init: " + e.getMessage());
             }
             msg = TbMsg.newMsg().data("{\"payload\":\"{\\\"key\\\":\\\"value\\\"}\"}").metaData(
-                localMeta).originator(new DeviceId(UUID.randomUUID())).build();
+                    localMeta).originator(new DeviceId(UUID.randomUUID())).build();
             node.onMsg(ctx, msg);
             verify(ctx).tellSuccess(
-                org.mockito.ArgumentMatchers.argThat(m -> {
-                    try {
-                        com.fasterxml.jackson.databind.JsonNode node = new com.fasterxml.jackson.databind.ObjectMapper().readTree(m.getData());
-                        return node.has("response") && node.get("response").has("key") && 
-                               "value".equals(node.get("response").get("key").asText());
-                    } catch (Exception e) {
-                        return false;
-                    }
-                })
-            );
+                    org.mockito.ArgumentMatchers.argThat(m -> {
+                        try {
+                            com.fasterxml.jackson.databind.JsonNode node = new com.fasterxml.jackson.databind.ObjectMapper()
+                                    .readTree(m.getData());
+                            return node.has("response") && node.get("response").has("key") &&
+                                    "value".equals(node.get("response").get("key").asText());
+                        } catch (Exception e) {
+                            return false;
+                        }
+                    }));
         } finally {
             TbSendToTcpNode.clientFactory = originalFactory;
         }
@@ -145,25 +166,27 @@ public class TbSendToTcpNodeTest {
         try {
             TbTcpClient mockClient = mock(TbTcpClient.class);
             try {
-                when(mockClient.sendRequest(org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
+                when(mockClient.sendRequest(org.mockito.ArgumentMatchers.anyString(),
+                        org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
                         .thenReturn("{\"response\":\"eqcADcABwQAHAQBeWwD/AgA=\"}");
-            } catch (java.io.IOException ignored) {}
-            TbSendToTcpNode.clientFactory = (h,p,t,ssl,ct,rt) -> mockClient;
-            
+            } catch (java.io.IOException ignored) {
+            }
+            TbSendToTcpNode.clientFactory = (h, p, t, ssl, ct, rt) -> mockClient;
+
             TbMsgMetaData localMeta = new TbMsgMetaData();
             localMeta.putValue("tcpHost", "3.109.15.103");
             localMeta.putValue("tcpPort", "10550");
-            localMeta.putValue("tcpTls", "false");
             localMeta.putValue("otherMeta", "Legacy Meta Chain");
             TbSendToTcpNodeConfiguration config = new TbSendToTcpNodeConfiguration();
             config.setHostKey("${tcpHost}");
             config.setPortKey("${tcpPort}");
-            config.setTlsKey("${tcpTls}");
+            config.setTls(false);
             config.setPayloadType("BINARY");
             config.setResponseType("BINARY");
             ObjectMapper mapper = new ObjectMapper();
             JsonNode json = mapper.valueToTree(config);
-            org.thingsboard.rule.engine.api.TbNodeConfiguration tbNodeConfig = new org.thingsboard.rule.engine.api.TbNodeConfiguration(json);
+            org.thingsboard.rule.engine.api.TbNodeConfiguration tbNodeConfig = new org.thingsboard.rule.engine.api.TbNodeConfiguration(
+                    json);
             try {
                 node.init(ctx, tbNodeConfig);
             } catch (org.thingsboard.rule.engine.api.TbNodeException e) {
@@ -175,18 +198,19 @@ public class TbSendToTcpNodeTest {
             // Use a real TbMsg instance so the internal processing context is initialized
             String base64Data = "{\"payload\":\"eqcADcABwQAHAQBeWwD/AgA=\"}";
             msg = TbMsg.newMsg().data(base64Data).metaData(
-                localMeta).originator(new DeviceId(UUID.randomUUID())).build();
+                    localMeta).originator(new DeviceId(UUID.randomUUID())).build();
             node.onMsg(ctx, msg);
             verify(ctx).tellSuccess(
-                org.mockito.ArgumentMatchers.argThat(m -> {
-                    try {
-                        com.fasterxml.jackson.databind.JsonNode node = new com.fasterxml.jackson.databind.ObjectMapper().readTree(m.getData());
-                        return node.has("response") && "eqcADcABwQAHAQBeWwD/AgA=".equals(node.get("response").asText());
-                    } catch (Exception e) {
-                        return false;
-                    }
-                })
-            );
+                    org.mockito.ArgumentMatchers.argThat(m -> {
+                        try {
+                            com.fasterxml.jackson.databind.JsonNode node = new com.fasterxml.jackson.databind.ObjectMapper()
+                                    .readTree(m.getData());
+                            return node.has("response")
+                                    && "eqcADcABwQAHAQBeWwD/AgA=".equals(node.get("response").asText());
+                        } catch (Exception e) {
+                            return false;
+                        }
+                    }));
         } finally {
             TbSendToTcpNode.clientFactory = originalFactory;
         }
@@ -198,45 +222,71 @@ public class TbSendToTcpNodeTest {
         try {
             TbTcpClient mockClient = mock(TbTcpClient.class);
             try {
-                when(mockClient.sendRequest(org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
+                when(mockClient.sendRequest(org.mockito.ArgumentMatchers.anyString(),
+                        org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
                         .thenReturn("{\"response\":\"test over tls\"}");
-            } catch (java.io.IOException ignored) {}
-            TbSendToTcpNode.clientFactory = (h,p,t,ssl,ct,rt) -> mockClient;
+            } catch (java.io.IOException ignored) {
+            }
+            TbSendToTcpNode.clientFactory = (h, p, t, ssl, ct, rt) -> mockClient;
             TbMsgMetaData localMeta = new TbMsgMetaData();
             localMeta.putValue("tcpHost", "3.109.15.103");
             localMeta.putValue("tcpPort", "10550");
-            localMeta.putValue("tcpTls", "true");
-            localMeta.putValue("caPem", "-----BEGIN CERTIFICATE-----\nMIIEqjCCA5KgAwIBAgIQAnmsRYvBskWr+YBTzSybsTANBgkqhkiG9w0BAQsFADBh\nMQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3\nd3cuZGlnaWNlcnQuY29tMSAwHgYDVQQDExdEaWdpQ2VydCBHbG9iYWwgUm9vdCBD\nQTAeFw0xNzExMjcxMjQ2MTBaFw0yNzExMjcxMjQ2MTBaMG4xCzAJBgNVBAYTAlVT\nMRUwEwYDVQQKEwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5j\nb20xLTArBgNVBAMTJEVuY3J5cHRpb24gRXZlcnl3aGVyZSBEViBUTFMgQ0EgLSBH\nMTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBALPeP6wkab41dyQh6mKc\noHqt3jRIxW5MDvf9QyiOR7VfFwK656es0UFiIb74N9pRntzF1UgYzDGu3ppZVMdo\nlbxhm6dWS9OK/lFehKNT0OYI9aqk6F+U7cA6jxSC+iDBPXwdF4rs3KRyp3aQn6pj\npp1yr7IB6Y4zv72Ee/PlZ/6rK6InC6WpK0nPVOYR7n9iDuPe1E4IxUMBH/T33+3h\nyuH3dvfgiWUOUkjdpMbyxX+XNle5uEIiyBsi4IvbcTCh8ruifCIi5mDXkZrnMT8n\nwfYCV6v6kDdXkbgGRLKsR4pucbJtbKqIkUGxuZI2t7pfewKRc5nWecvDBZf3+p1M\npA8CAwEAAaOCAU8wggFLMB0GA1UdDgQWBBRVdE+yck/1YLpQ0dfmUVyaAYca1zAf\nBgNVHSMEGDAWgBQD3lA1VtFMu2bwo+IbG8OXsj3RVTAOBgNVHQ8BAf8EBAMCAYYw\nHQYDVR0lBBYwFAYIKwYBBQUHAwEGCCsGAQUFBwMCMBIGA1UdEwEB/wQIMAYBAf8C\nAQAwNAYIKwYBBQUHAQEEKDAmMCQGCCsGAQUFBzABhhhodHRwOi8vb2NzcC5kaWdp\nY2VydC5jb20wQgYDVR0fBDswOTA3oDWgM4YxaHR0cDovL2NybDMuZGlnaWNlcnQu\nY29tL0RpZ2lDZXJ0R2xvYmFsUm9vdENBLmNybDBMBgNVHSAERTBDMDcGCWCGSAGG\n/WwBAjAqMCgGCCsGAQUFBwIBFhxodHRwczovL3d3dy5kaWdpY2VydC5jb20vQ1BT\nMAgGBmeBDAECATANBgkqhkiG9w0BAQsFAAOCAQEAK3Gp6/aGq7aBZsxf/oQ+TD/B\nSwW3AU4ETK+GQf2kFzYZkby5SFrHdPomunx2HBzViUchGoofGgg7gHW0W3MlQAXW\nM0r5LUvStcr82QDWYNPaUy4taCQmyaJ+VB+6wxHstSigOlSNF2a6vg4rgexixeiV\n4YSB03Yqp2t3TeZHM9ESfkus74nQyW7pRGezj+TC44xCagCQQOzzNmzEAP2SnCrJ\nsNE2DpRVMnL8J6xBRdjmOsC3N6cQuKuRXbzByVBjCqAA8t1L0I+9wXJerLPyErjy\nrMKWaBFLmfK/AHNF4ZihwPGOc7w6UHczBZXH5RFzJNnww+WnKuTPI0HfnVH8lg==\n-----END CERTIFICATE-----");
+            localMeta.putValue("caPem", "-----BEGIN CERTIFICATE-----\n" + //
+                    "MIIEJzCCAw+gAwIBAgIUU2GTeytpdw+43i05YCL0yNypBcMwDQYJKoZIhvcNAQEL\n" + //
+                    "BQAwgaIxCzAJBgNVBAYTAklOMRIwEAYDVQQIDAlUYW1pbG5hZHUxEzARBgNVBAcM\n" + //
+                    "CkNvaW1iYXRvcmUxEDAOBgNVBAoMB1NjaG5lbGwxCzAJBgNVBAsMAklUMRswGQYD\n" + //
+                    "VQQDDBJTY2huZWxsLVByaXZhdGUtQ0ExLjAsBgkqhkiG9w0BCQEWH2l0LmVuZ2lu\n" + //
+                    "ZWVyMTFAc2NobmVsbGVuZXJneS5jb20wHhcNMjUxMTI1MDcxODE3WhcNMzAxMTI0\n" + //
+                    "MDcxODE3WjCBojELMAkGA1UEBhMCSU4xEjAQBgNVBAgMCVRhbWlsbmFkdTETMBEG\n" + //
+                    "A1UEBwwKQ29pbWJhdG9yZTEQMA4GA1UECgwHU2NobmVsbDELMAkGA1UECwwCSVQx\n" + //
+                    "GzAZBgNVBAMMElNjaG5lbGwtUHJpdmF0ZS1DQTEuMCwGCSqGSIb3DQEJARYfaXQu\n" + //
+                    "ZW5naW5lZXIxMUBzY2huZWxsZW5lcmd5LmNvbTCCASIwDQYJKoZIhvcNAQEBBQAD\n" + //
+                    "ggEPADCCAQoCggEBALr2ahyrSKc+7Owp2Un666WFMre6zpfnZIEyow+nzg5wYD+D\n" + //
+                    "7gDS/aSJSmNu0CLLcS5sB03DvUsNNKbbwWIeL99n4Bmd2WoqAkHgYrAjuWvqk+4a\n" + //
+                    "IjrrLzgd/eICsBd6y2gD4h/7Wrg6+youuZ2jiMJM4iM4sGfHweFDH7R83UO6r0Ek\n" + //
+                    "0qmJ1dNWGTX+nP2OkscsMTanPp9YZOzOu0e6VkQRUhi4Bt1sCamHlbloLhHhyuFk\n" + //
+                    "242OwzzDbbOyD3SH85TwlWb/Z+VVM6kfB0uXg6aOm0PzdYfAHsWv0rNFawd7U66V\n" + //
+                    "Cjay1sHKivfTr2WO4iSoFpE+QVJegdNUrFLKF5ECAwEAAaNTMFEwHQYDVR0OBBYE\n" + //
+                    "FA9PdzIDQpEh6s0j3A6dXBYbCfZYMB8GA1UdIwQYMBaAFA9PdzIDQpEh6s0j3A6d\n" + //
+                    "XBYbCfZYMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggEBAJQq4O/u\n" + //
+                    "i2eEByh1J90mVMu1OqHT6tkp/O9BjHRoHriPiDA81E3ZhntkQE4ptxeunulopQqa\n" + //
+                    "yGXy10asc+Dvsdc8o0nXwkyDP5MWGJuN5Pd6P+3T6ZwKOWVTVSJEiCgd3n5fhXPx\n" + //
+                    "1hKndw0MUsXYy4IkrNMO9bsJVfyxbe0BTeqLIL8TLfta0QTjBSVw7affIsjUxNxR\n" + //
+                    "jXQ3xPy/mheURkAGgPJk2kaInPWjfAWgEojf+vOnTthnIHWR3sVpZDgMfnAkhaX7\n" + //
+                    "O57elGC3mwmjfaLGAhU33ezLzY2XkbvGJ77uYzZq3WE4jl4smf46gJsuRlYn2Ul1\n" + //
+                    "vEr9+mqowdIZkoI=\n" + //
+                    "-----END CERTIFICATE-----");
             localMeta.putValue("keyPassword", "");
             TbSendToTcpNodeConfiguration config = new TbSendToTcpNodeConfiguration();
             config.setHostKey("${tcpHost}");
             config.setPortKey("${tcpPort}");
-            config.setTlsKey("${tcpTls}");
-            config.setPayloadType("TEXT");
-            config.setResponseType("TEXT");
+            config.setTls(true);
+            config.setPayloadType("BINARY");
+            config.setResponseType("BINARY");
             config.getTlsConfig().setCaCertificateKey("${caPem}");
-            config.getTlsConfig().setVerifyServerCertificate(true);
+            config.getTlsConfig().setVerifyServerCertificate(false);
             ObjectMapper mapper = new ObjectMapper();
             JsonNode json = mapper.valueToTree(config);
-            org.thingsboard.rule.engine.api.TbNodeConfiguration tbNodeConfig = new org.thingsboard.rule.engine.api.TbNodeConfiguration(json);
+            org.thingsboard.rule.engine.api.TbNodeConfiguration tbNodeConfig = new org.thingsboard.rule.engine.api.TbNodeConfiguration(
+                    json);
             try {
                 node.init(ctx, tbNodeConfig);
             } catch (org.thingsboard.rule.engine.api.TbNodeException e) {
                 org.junit.jupiter.api.Assertions.fail("TbNodeException during init: " + e.getMessage());
             }
-            msg = TbMsg.newMsg().data("{\"payload\":\"test over tls\"}").metaData(
-                localMeta).originator(new DeviceId(UUID.randomUUID())).build();
+            msg = TbMsg.newMsg().data("{\"payload\":\"eqcAD8MBwQAoAAcZCQD/AQEPAA==\"}").metaData(
+                    localMeta).originator(new DeviceId(UUID.randomUUID())).build();
             node.onMsg(ctx, msg);
             verify(ctx).tellSuccess(
-                org.mockito.ArgumentMatchers.argThat(m -> {
-                    try {
-                        com.fasterxml.jackson.databind.JsonNode node = new com.fasterxml.jackson.databind.ObjectMapper().readTree(m.getData());
-                        return node.has("response") && "test over tls".equals(node.get("response").asText());
-                    } catch (Exception e) {
-                        return false;
-                    }
-                })
-            );
+                    org.mockito.ArgumentMatchers.argThat(m -> {
+                        try {
+                            com.fasterxml.jackson.databind.JsonNode node = new com.fasterxml.jackson.databind.ObjectMapper()
+                                    .readTree(m.getData());
+                            return node.has("response") && "test over tls".equals(node.get("response").asText());
+                        } catch (Exception e) {
+                            return false;
+                        }
+                    }));
         } finally {
             TbSendToTcpNode.clientFactory = originalFactory;
         }
@@ -247,7 +297,6 @@ public class TbSendToTcpNodeTest {
         TbMsgMetaData localMeta = new TbMsgMetaData();
         localMeta.putValue("tcpHost", "3.109.15.103");
         localMeta.putValue("tcpPort", "10550");
-        localMeta.putValue("tcpTls", "true");
         localMeta.putValue("caPem", "invalid-ca");
         localMeta.putValue("certPem", "invalid-cert");
         localMeta.putValue("keyPem", "invalid-key");
@@ -255,12 +304,13 @@ public class TbSendToTcpNodeTest {
         TbSendToTcpNodeConfiguration config = new TbSendToTcpNodeConfiguration();
         config.setHostKey("${tcpHost}");
         config.setPortKey("${tcpPort}");
-        config.setTlsKey("${tcpTls}");
+        config.setTls(true);
         config.setPayloadType("TEXT");
         config.setResponseType("TEXT");
         ObjectMapper mapper = new ObjectMapper();
         JsonNode json = mapper.valueToTree(config);
-        org.thingsboard.rule.engine.api.TbNodeConfiguration tbNodeConfig = new org.thingsboard.rule.engine.api.TbNodeConfiguration(json);
+        org.thingsboard.rule.engine.api.TbNodeConfiguration tbNodeConfig = new org.thingsboard.rule.engine.api.TbNodeConfiguration(
+                json);
         try {
             node.init(ctx, tbNodeConfig);
         } catch (org.thingsboard.rule.engine.api.TbNodeException e) {
@@ -277,7 +327,6 @@ public class TbSendToTcpNodeTest {
     public void testInvalidPort() {
         metaData.putValue("tcpHost", "127.0.0.1");
         metaData.putValue("tcpPort", "notaport");
-        metaData.putValue("tcpTls", "false");
         msg = mock(TbMsg.class);
         when(msg.getMetaData()).thenReturn(metaData);
         when(msg.getData()).thenReturn("[\"test\"]");
@@ -288,7 +337,6 @@ public class TbSendToTcpNodeTest {
     @Test
     public void testNoHost() {
         metaData.putValue("tcpPort", "1234");
-        metaData.putValue("tcpTls", "false");
         msg = mock(TbMsg.class);
         when(msg.getMetaData()).thenReturn(metaData);
         when(msg.getData()).thenReturn("[\"test\"]");
@@ -300,7 +348,6 @@ public class TbSendToTcpNodeTest {
     @Test
     public void testNoPort() {
         metaData.putValue("tcpHost", "127.0.0.1");
-        metaData.putValue("tcpTls", "false");
         msg = mock(TbMsg.class);
         when(msg.getMetaData()).thenReturn(metaData);
         when(msg.getData()).thenReturn("[\"test\"]");
@@ -312,7 +359,6 @@ public class TbSendToTcpNodeTest {
     public void testNoTls() {
         metaData.putValue("tcpHost", "127.0.0.1");
         metaData.putValue("tcpPort", "1234");
-        metaData.putValue("tcpTls", "false");
         msg = mock(TbMsg.class);
         when(msg.getMetaData()).thenReturn(metaData);
         when(msg.getData()).thenReturn("[\"test\"]");
@@ -325,7 +371,25 @@ public class TbSendToTcpNodeTest {
     public void testWithTlsPem() {
         metaData.putValue("tcpHost", "127.0.0.1");
         metaData.putValue("tcpPort", "1234");
-        metaData.putValue("tcpTls", "true");
+        // Re-init node with TLS enabled
+        TbSendToTcpNodeConfiguration config = new TbSendToTcpNodeConfiguration();
+        config.setHostKey("${tcpHost}");
+        config.setPortKey("${tcpPort}");
+        config.setTls(true);
+        config.getTlsConfig().setCaCertificateKey("${caPem}");
+        config.getTlsConfig().setCertificateKey("${certPem}");
+        config.getTlsConfig().setPrivateKeyKey("${keyPem}");
+        config.getTlsConfig().setPrivateKeyPassphraseKey("${keyPassword}");
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode json = mapper.valueToTree(config);
+        org.thingsboard.rule.engine.api.TbNodeConfiguration tbNodeConfig = new org.thingsboard.rule.engine.api.TbNodeConfiguration(
+                json);
+        try {
+            node.init(ctx, tbNodeConfig);
+        } catch (org.thingsboard.rule.engine.api.TbNodeException e) {
+            org.junit.jupiter.api.Assertions.fail("TbNodeException during init: " + e.getMessage());
+        }
+
         metaData.putValue("caPem", "-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----");
         metaData.putValue("certPem", "-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----");
         metaData.putValue("keyPem", "-----BEGIN PRIVATE KEY-----\nMIIE...\n-----END PRIVATE KEY-----");
