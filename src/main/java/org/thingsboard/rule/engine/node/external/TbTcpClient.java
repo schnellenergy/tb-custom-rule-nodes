@@ -15,6 +15,7 @@
  */
 package org.thingsboard.rule.engine.node.external;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -66,16 +67,20 @@ public class TbTcpClient {
             out.write(payload);
             out.flush();
             InputStream in = socket.getInputStream();
+            ByteArrayOutputStream responseBuffer = new ByteArrayOutputStream();
             byte[] buffer = new byte[4096];
-            int len = in.read(buffer);
-            if (len == -1) {
+            int len;
+            try {
+                while ((len = in.read(buffer)) != -1) {
+                    responseBuffer.write(buffer, 0, len);
+                }
+            } catch (SocketTimeoutException e) {
+                // No more data arrived within readTimeoutMs — treat as end of response
+            }
+            if (responseBuffer.size() == 0) {
                 throw new IOException("No response received from TCP server");
             }
-            byte[] response = new byte[len];
-            System.arraycopy(buffer, 0, response, 0, len);
-            return response;
-        } catch (SocketTimeoutException e) {
-            throw new IOException("TCP read timed out", e);
+            return responseBuffer.toByteArray();
         } finally {
             if (socket != null) {
                 try {
