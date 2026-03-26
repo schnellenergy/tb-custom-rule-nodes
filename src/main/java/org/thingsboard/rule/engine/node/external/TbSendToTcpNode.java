@@ -208,18 +208,191 @@ public class TbSendToTcpNode implements TbNode {
         return ctx.getSocketFactory();
     }
 
-    // Helper: parse PEM private key (PKCS#8, RSA or EC)
+    // Helper: parse PEM private key (PKCS#8, PKCS#1 RSA, or SEC1 EC)
     private java.security.PrivateKey loadPrivateKeyFromPem(String pem, String password) throws Exception {
+        String trimmedPem = pem.trim();
+
+        // Detect key format from PEM header
+        boolean isPkcs1Rsa = trimmedPem.contains("-----BEGIN RSA PRIVATE KEY-----");
+        boolean isSec1Ec = trimmedPem.contains("-----BEGIN EC PRIVATE KEY-----");
+        boolean isPkcs8 = trimmedPem.contains("-----BEGIN PRIVATE KEY-----");
+
+        // Strip PEM headers/footers and whitespace
         String privKeyPEM = pem.replaceAll("-----BEGIN (.*)-----", "")
                 .replaceAll("-----END (.*)-----(\\r)?\\n?", "")
                 .replaceAll("\\s", "");
         byte[] encoded = java.util.Base64.getDecoder().decode(privKeyPEM);
-        java.security.spec.PKCS8EncodedKeySpec keySpec = new java.security.spec.PKCS8EncodedKeySpec(encoded);
-        try {
+
+        if (isPkcs8) {
+            // Standard PKCS#8 format - try RSA first, then EC
+            java.security.spec.PKCS8EncodedKeySpec keySpec = new java.security.spec.PKCS8EncodedKeySpec(encoded);
+            try {
+                return java.security.KeyFactory.getInstance("RSA").generatePrivate(keySpec);
+            } catch (Exception e) {
+                return java.security.KeyFactory.getInstance("EC").generatePrivate(keySpec);
+            }
+        } else if (isPkcs1Rsa) {
+            // PKCS#1 RSA format - need to wrap in PKCS#8 structure
+            byte[] pkcs8Bytes = wrapRsaPkcs1InPkcs8(encoded);
+            java.security.spec.PKCS8EncodedKeySpec keySpec = new java.security.spec.PKCS8EncodedKeySpec(pkcs8Bytes);
             return java.security.KeyFactory.getInstance("RSA").generatePrivate(keySpec);
-        } catch (Exception e) {
-            return java.security.KeyFactory.getInstance("EC").generatePrivate(keySpec);
+        } else if (isSec1Ec) {
+            // SEC1 EC format - parse the EC parameters and private key
+            return parseEc1PrivateKey(encoded);
+        } else {
+            // Unknown format - try PKCS#8 as fallback
+            java.security.spec.PKCS8EncodedKeySpec keySpec = new java.security.spec.PKCS8EncodedKeySpec(encoded);
+            try {
+                return java.security.KeyFactory.getInstance("RSA").generatePrivate(keySpec);
+            } catch (Exception e) {
+                return java.security.KeyFactory.getInstance("EC").generatePrivate(keySpec);
+            }
         }
+    }
+
+    // Wrap PKCS#1 RSA private key in PKCS#8 structure
+    private byte[] wrapRsaPkcs1InPkcs8(byte[] pkcs1Bytes) throws Exception {
+        // PKCS#8 header for RSA: SEQUENCE { SEQUENCE { OID rsaEncryption, NULL }, OCTET
+        // STRING { pkcs1 key } }
+        byte[] rsaOid = new byte[] { 0x06, 0x09, 0x2a, (byte) 0x86, 0x48, (byte) 0x86, (byte) 0xf7, 0x0d, 0x01, 0x01,
+                0x01 };
+        byte[] nullTag = new byte[] { 0x05, 0x00 };
+
+        // Build AlgorithmIdentifier SEQUENCE
+        int algIdLen = rsaOid.length + nullTag.length;
+        byte[] algIdSeq = buildAsn1Sequence(concatBytes(rsaOid, nullTag));
+
+        // Build OCTET STRING containing PKCS#1 key
+        byte[] octetString = buildAsn1OctetString(pkcs1Bytes);
+
+        // Build outer SEQUENCE containing version(0), AlgorithmIdentifier, and OCTET
+        // STRING
+        byte[] version = new byte[] { 0x02, 0x01, 0x00 }; // INTEGER 0
+        byte[] pkcs8Content = concatBytes(version, concatBytes(algIdSeq, octetString));
+        return buildAsn1Sequence(pkcs8Content);
+    }
+
+    // Parse SEC1 EC private key format
+    private java.security.PrivateKey parseEc1PrivateKey(byte[] sec1Bytes) throws Exception {
+        // SEC1 format: SEQUENCE { version INTEGER, privateKey OCTET STRING, [0]
+        // parameters, [1] publicKey }
+        // We need to wrap this in PKCS#8 format for Java's KeyFactory
+
+        // Extract the curve OID from the SEC1 structure (context tag [0])
+        byte[] curveOid = extractCurveOidFromSec1(sec1Bytes);
+        if (curveOid == null) {
+            // Default to prime256v1 (P-256) if no curve specified
+            curveOid = new byte[] { 0x06, 0x08, 0x2a, (byte) 0x86, 0x48, (byte) 0xce, 0x3d, 0x03, 0x01, 0x07 };
+        }
+
+        // Build PKCS#8 structure for EC key
+        // AlgorithmIdentifier: SEQUENCE { OID ecPublicKey, OID namedCurve }
+        byte[] ecOid = new byte[] { 0x06, 0x07, 0x2a, (byte) 0x86, 0x48, (byte) 0xce, 0x3d, 0x02, 0x01 };
+        byte[] algIdContent = concatBytes(ecOid, curveOid);
+        byte[] algIdSeq = buildAsn1Sequence(algIdContent);
+
+        // Build OCTET STRING containing SEC1 key
+        byte[] octetString = buildAsn1OctetString(sec1Bytes);
+
+        // Build outer SEQUENCE: version(0), AlgorithmIdentifier, OCTET STRING
+        byte[] version = new byte[] { 0x02, 0x01, 0x00 };
+        byte[] pkcs8Content = concatBytes(version, concatBytes(algIdSeq, octetString));
+        byte[] pkcs8Bytes = buildAsn1Sequence(pkcs8Content);
+
+        java.security.spec.PKCS8EncodedKeySpec keySpec = new java.security.spec.PKCS8EncodedKeySpec(pkcs8Bytes);
+        return java.security.KeyFactory.getInstance("EC").generatePrivate(keySpec);
+    }
+
+    // Extract curve OID from SEC1 structure
+    private byte[] extractCurveOidFromSec1(byte[] sec1Bytes) {
+        // Look for context tag [0] which contains the curve parameters (OID)
+        int pos = 0;
+        if (sec1Bytes[pos] != 0x30)
+            return null; // Not a SEQUENCE
+        pos++;
+        int seqLen = readAsn1Length(sec1Bytes, pos);
+        pos += lengthOfLength(sec1Bytes, pos);
+
+        // Skip version
+        if (sec1Bytes[pos] != 0x02)
+            return null;
+        pos++;
+        int verLen = sec1Bytes[pos] & 0xFF;
+        pos += 1 + verLen;
+
+        // Skip private key OCTET STRING
+        if (sec1Bytes[pos] != 0x04)
+            return null;
+        pos++;
+        int keyLen = readAsn1Length(sec1Bytes, pos);
+        pos += lengthOfLength(sec1Bytes, pos) + keyLen;
+
+        // Look for context tag [0] = 0xA0
+        if (pos < sec1Bytes.length && (sec1Bytes[pos] & 0xFF) == 0xA0) {
+            pos++;
+            int paramLen = readAsn1Length(sec1Bytes, pos);
+            pos += lengthOfLength(sec1Bytes, pos);
+            // Extract the OID
+            byte[] oid = new byte[paramLen];
+            System.arraycopy(sec1Bytes, pos, oid, 0, paramLen);
+            return oid;
+        }
+        return null;
+    }
+
+    private int readAsn1Length(byte[] data, int pos) {
+        int len = data[pos] & 0xFF;
+        if (len < 128)
+            return len;
+        int numBytes = len & 0x7F;
+        len = 0;
+        for (int i = 0; i < numBytes; i++) {
+            len = (len << 8) | (data[pos + 1 + i] & 0xFF);
+        }
+        return len;
+    }
+
+    private int lengthOfLength(byte[] data, int pos) {
+        int len = data[pos] & 0xFF;
+        if (len < 128)
+            return 1;
+        return 1 + (len & 0x7F);
+    }
+
+    private byte[] buildAsn1Sequence(byte[] content) {
+        return buildAsn1Tagged((byte) 0x30, content);
+    }
+
+    private byte[] buildAsn1OctetString(byte[] content) {
+        return buildAsn1Tagged((byte) 0x04, content);
+    }
+
+    private byte[] buildAsn1Tagged(byte tag, byte[] content) {
+        byte[] lenBytes = encodeAsn1Length(content.length);
+        byte[] result = new byte[1 + lenBytes.length + content.length];
+        result[0] = tag;
+        System.arraycopy(lenBytes, 0, result, 1, lenBytes.length);
+        System.arraycopy(content, 0, result, 1 + lenBytes.length, content.length);
+        return result;
+    }
+
+    private byte[] encodeAsn1Length(int len) {
+        if (len < 128) {
+            return new byte[] { (byte) len };
+        } else if (len < 256) {
+            return new byte[] { (byte) 0x81, (byte) len };
+        } else if (len < 65536) {
+            return new byte[] { (byte) 0x82, (byte) (len >> 8), (byte) len };
+        } else {
+            return new byte[] { (byte) 0x83, (byte) (len >> 16), (byte) (len >> 8), (byte) len };
+        }
+    }
+
+    private byte[] concatBytes(byte[] a, byte[] b) {
+        byte[] result = new byte[a.length + b.length];
+        System.arraycopy(a, 0, result, 0, a.length);
+        System.arraycopy(b, 0, result, a.length, b.length);
+        return result;
     }
 
     @Override
