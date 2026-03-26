@@ -259,7 +259,6 @@ public class TbSendToTcpNode implements TbNode {
         byte[] nullTag = new byte[] { 0x05, 0x00 };
 
         // Build AlgorithmIdentifier SEQUENCE
-        int algIdLen = rsaOid.length + nullTag.length;
         byte[] algIdSeq = buildAsn1Sequence(concatBytes(rsaOid, nullTag));
 
         // Build OCTET STRING containing PKCS#1 key
@@ -310,7 +309,6 @@ public class TbSendToTcpNode implements TbNode {
         if (sec1Bytes[pos] != 0x30)
             return null; // Not a SEQUENCE
         pos++;
-        int seqLen = readAsn1Length(sec1Bytes, pos);
         pos += lengthOfLength(sec1Bytes, pos);
 
         // Skip version
