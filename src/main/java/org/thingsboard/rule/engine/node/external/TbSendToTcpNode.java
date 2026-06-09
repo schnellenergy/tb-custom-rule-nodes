@@ -25,6 +25,10 @@ import org.thingsboard.server.common.data.plugin.ComponentType;
 import org.thingsboard.server.common.msg.TbMsg;
 import org.thingsboard.server.common.msg.TbMsgDataType;
 
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 
 /**
@@ -33,9 +37,49 @@ import lombok.extern.slf4j.Slf4j;
  * Created by Kalaivanan S on 11-July-2025.
  */
 @Slf4j
-@RuleNode(type = ComponentType.EXTERNAL, name = "tcp request", configClazz = TbSendToTcpNodeConfiguration.class, nodeDescription = "Send message data to a TCP endpoint. Payload data type can be one of TEXT, JSON or BINARY.", nodeDetails = "v1.0.0: Reads target host, port, and TLS/PEM configuration from metadata or message using templatized keys <code>${metadata_key}</code>, <code>$[message_key]</code>. The message data must contain a <code>payload</code> key (e.g., <code>{\"payload\":...}</code). The value of 'payload' is sent as the TCP payload. Supports both plain TCP and TLS (with trust credentials shall be passed as part of the message data or metadata).", uiResources = {
+@RuleNode(type = ComponentType.EXTERNAL, name = "tcp request", configClazz = TbSendToTcpNodeConfiguration.class, nodeDescription = "Send message data to a TCP endpoint. Payload data type can be one of TEXT, JSON or BINARY.", nodeDetails = "<span>Reads target host and port using templatized keys <code>${metadata_key}</code> or <code>$[message_key]</code>. The incoming message JSON must contain a <code>payload</code> field whose value is sent as the TCP payload. The response is attached to the outbound message.</span><br/><br/>"
+                + "<span><strong>Connection Settings</strong></span>"
+                + "<ul>"
+                + "<li><code>hostKey</code> / <code>portKey</code> &ndash; Template expressions that resolve to the target host and port from metadata or message data. Defaults: <code>${tcpHost}</code> / <code>${tcpPort}</code>.</li>"
+                + "<li><code>connectTimeout</code> &ndash; Maximum time (ms) allowed for the TCP handshake. Default: <code>1000 ms</code>.</li>"
+                + "<li><code>readTimeout</code> &ndash; Maximum idle time (ms) while reading a response. Default: <code>5000 ms</code>.</li>"
+                + "<li><code>keepAlive</code> &ndash; When <code>true</code>, sockets are kept open and reused from the pool. Default: <code>true</code>.</li>"
+                + "<li><code>maxConnections</code> &ndash; Size of the connection pool per host/port pair. Set to <code>0</code> to disable pooling. Default: <code>10</code>.</li>"
+                + "</ul>"
+                + "<span><strong>Payload &amp; Response Types</strong></span>"
+                + "<ul>"
+                + "<li><code>payloadType</code> &ndash; How the <code>payload</code> field is serialized before sending: <code>TEXT</code> (UTF-8 string), <code>JSON</code> (stringified JSON), or <code>BINARY</code> (Base64-decoded bytes). Default: <code>TEXT</code>.</li>"
+                + "<li><code>responseType</code> &ndash; How the response bytes are interpreted in the outbound message. Same options as <code>payloadType</code>. Default: <code>TEXT</code>.</li>"
+                + "</ul>"
+                + "<span><strong>Response Framing</strong> &ndash; controlled by <code>framingType</code>:</span>"
+                + "<ul>"
+                + "<li><code>NONE</code> (smart-timeout) &ndash; Reads until no new data arrives for <code>fragmentTimeoutMs</code> ms or the server closes the connection. Default fragment timeout: <code>50 ms</code>. Increase if the server sends large responses in multiple TCP segments.</li>"
+                + "<li><code>DELIMITER</code> &ndash; Reads until a specific byte sequence is found. Configure <code>delimiter</code> using escape sequences: <code>\\n</code> (LF), <code>\\r\\n</code> (CRLF), <code>\\t</code> (TAB), or hex e.g. <code>\\x00</code>. Default: <code>\\n</code>.</li>"
+                + "<li><code>LENGTH_PREFIX</code> (Netty-style) &ndash; Reads a fixed-size length field from the stream, then reads exactly that many bytes. Parameters:"
+                + "<ul>"
+                + "<li><code>lengthFieldOffset</code> &ndash; Byte offset where the length field starts (default <code>0</code>).</li>"
+                + "<li><code>lengthFieldLength</code> &ndash; Size of the length field in bytes: 1, 2, 3, 4, or 8 (default <code>4</code>).</li>"
+                + "<li><code>lengthAdjustment</code> &ndash; Value added to the length field to obtain the full frame length (default <code>0</code>).</li>"
+                + "<li><code>initialBytesToStrip</code> &ndash; Bytes to discard from the start of the decoded frame, e.g. to remove the length header itself (default <code>0</code>).</li>"
+                + "<li><code>maxFrameLength</code> &ndash; Safety limit in bytes; frames larger than this cause an error (default <code>1 048 576</code> = 1 MiB).</li>"
+                + "<li><code>lengthByteOrder</code> &ndash; <code>BIG_ENDIAN</code> or <code>LITTLE_ENDIAN</code> (default <code>BIG_ENDIAN</code>).</li>"
+                + "</ul>"
+                + "</li>"
+                + "</ul>"
+                + "<span><strong>TLS Configuration</strong> (when <code>tls</code> is enabled)</span>"
+                + "<ul>"
+                + "<li><code>caCertificateKey</code> &ndash; Templatized key resolving to a PEM CA certificate for server trust verification.</li>"
+                + "<li><code>certificateKey</code> / <code>privateKeyKey</code> &ndash; Templatized keys for the client certificate and private key (mutual TLS). Supports PKCS#8, PKCS#1 RSA, and SEC1 EC formats.</li>"
+                + "<li><code>privateKeyPassphraseKey</code> &ndash; Templatized key for the private-key passphrase (if encrypted).</li>"
+                + "<li><code>verifyServerCertificate</code> &ndash; Set to <code>false</code> to disable server certificate validation (insecure &ndash; testing only). Default: <code>true</code>.</li>"
+                + "<li><code>serverNameKey</code> &ndash; Templatized key for SNI hostname sent during TLS handshake.</li>"
+                + "<li><code>alpnProtocolKey</code> &ndash; Templatized key for ALPN protocol negotiation (e.g. <code>h2</code>).</li>"
+                + "</ul>"
+                + "<span><strong>Output:</strong> On success the node emits the TCP response as a new message on the <em>Success</em> chain. On any error (connection refused, timeout, framing error, missing <code>payload</code> key) the original message is forwarded on the <em>Failure</em> chain with the exception detail.</span>", uiResources = {
         "static/rulenode/custom-nodes-config.js" }, configDirective = "tbExternalNodeSendToTcpConfig", icon = "call_made")
 public class TbSendToTcpNode implements TbNode {
+
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private TbSendToTcpNodeConfiguration config;
     private String hostKey;
@@ -45,15 +89,18 @@ public class TbSendToTcpNode implements TbNode {
     private String payloadType;
     private String responseType;
 
+    private volatile TbTcpConnectionPool pool;
+    private final ConcurrentMap<String, javax.net.ssl.SSLSocketFactory> sslSocketFactoryCache = new ConcurrentHashMap<>();
+
     // Client factory to allow tests to inject mocks. Defaults to real client
     // constructor.
     public interface ClientFactory {
         TbTcpClient create(String host, int port, boolean tls, javax.net.ssl.SSLSocketFactory sslFactory,
-                int connectTimeoutMs, int readTimeoutMs);
+                int connectTimeoutMs, int readTimeoutMs, boolean keepAlive);
     }
 
     public static volatile ClientFactory clientFactory = (host, port, tls, sslFactory, connectTimeoutMs,
-            readTimeoutMs) -> new TbTcpClient(host, port, tls, sslFactory, connectTimeoutMs, readTimeoutMs);
+            readTimeoutMs, keepAlive) -> new TbTcpClient(host, port, tls, sslFactory, connectTimeoutMs, readTimeoutMs, keepAlive);
 
     @Override
     public void init(TbContext ctx, TbNodeConfiguration configuration) throws TbNodeException {
@@ -64,95 +111,125 @@ public class TbSendToTcpNode implements TbNode {
         tlsConfig = config.getTlsConfig();
         payloadType = config.getPayloadType() != null ? config.getPayloadType() : "TEXT";
         responseType = config.getResponseType() != null ? config.getResponseType() : "TEXT";
+        
+        pool = new TbTcpConnectionPool(
+                config.getMaxConnections(),
+                config.getConnectTimeout(),
+                config.getReadTimeout(),
+                config.isKeepAlive());
+    }
+
+    @Override
+    public void destroy() {
+        if (pool != null) {
+            pool.closeAll();
+        }
     }
 
     @Override
     public void onMsg(TbContext ctx, TbMsg msg) {
-        String targetHost, portStr;
-        try {
-            targetHost = TbNodeUtils.processPattern(hostKey, msg);
-            portStr = TbNodeUtils.processPattern(portKey, msg);
-        } catch (IllegalArgumentException iae) {
-            log.error("Failed to process pattern for host/port", iae);
-            ctx.tellFailure(msg,
-                    new IllegalArgumentException("Failed to process pattern for host/port: " + iae.getMessage(), iae));
-            return;
-        }
-
-        int targetPort = 0;
-        try {
-            targetPort = Integer.parseInt(portStr);
-        } catch (Exception e) {
-            log.error("Message doesn't contain a valid port: {}", portStr);
-            ctx.tellFailure(msg, new IllegalArgumentException("Message doesn't contain a valid port: " + portStr));
-            return;
-        }
-        try {
-            javax.net.ssl.SSLSocketFactory sslFactory = null;
-            if (tls) {
-                String caPem = tlsConfig.getCaCertificateKey() != null
-                        ? TbNodeUtils.processPattern(tlsConfig.getCaCertificateKey(), msg)
-                        : null;
-                String certPem = tlsConfig.getCertificateKey() != null
-                        ? TbNodeUtils.processPattern(tlsConfig.getCertificateKey(), msg)
-                        : null;
-                String keyPem = tlsConfig.getPrivateKeyKey() != null
-                        ? TbNodeUtils.processPattern(tlsConfig.getPrivateKeyKey(), msg)
-                        : null;
-                String keyPassword = tlsConfig.getPrivateKeyPassphraseKey() != null
-                        ? TbNodeUtils.processPattern(tlsConfig.getPrivateKeyPassphraseKey(), msg)
-                        : null;
-                boolean verifyServerCert = tlsConfig.getVerifyServerCertificate() == null
-                        || tlsConfig.getVerifyServerCertificate();
-                sslFactory = createSSLSocketFactoryFromPem(caPem, certPem, keyPem, keyPassword, verifyServerCert);
-            }
-            TbMsgDataType pt = TbMsgDataType.valueOf(payloadType.toUpperCase());
-            TbMsgDataType rt = TbMsgDataType.valueOf(responseType.toUpperCase());
-            int connectTimeout = config.getConnectTimeout() > 0 ? config.getConnectTimeout() : 1000;
-            int readTimeout = config.getReadTimeout() > 0 ? config.getReadTimeout() : 5000;
-            TbTcpClient client = clientFactory.create(targetHost, targetPort, tls, sslFactory, connectTimeout,
-                    readTimeout);
-            String payload = null;
+        ctx.getExternalCallExecutor().execute(() -> {
+            String targetHost, portStr;
             try {
-                com.fasterxml.jackson.databind.JsonNode dataNode = com.fasterxml.jackson.databind.node.NullNode
-                        .getInstance();
-                if (msg.getData() != null && !msg.getData().isEmpty()) {
-                    dataNode = new com.fasterxml.jackson.databind.ObjectMapper().readTree(msg.getData());
-                }
-                if (dataNode.has("payload")) {
-                    payload = dataNode.get("payload").asText();
-                }
-            } catch (Exception ex) {
-                log.error("Failed to parse message data for 'payload' key", ex);
-                ctx.tellFailure(msg, new IllegalArgumentException(
-                        "Failed to parse message data for 'payload' key: " + ex.getMessage()));
-                return;
-            }
-            if (payload == null) {
-                log.error("No 'payload' key found in msg data");
-                ctx.tellFailure(msg, new IllegalArgumentException("No 'payload' key found in msg data"));
-                return;
-            }
-            try {
-                String response = client.sendRequest(payload, pt, rt);
-
-                // Convert response to a TbMsg
-                TbMsg responseMsg = msg.transform()
-                        .data(response)
-                        .dataType(rt) // Keep original response type
-                        .build();
-                log.debug("Received TCP response: {}", response);
-                ctx.tellSuccess(responseMsg);
-            } catch (IllegalArgumentException | java.io.IOException e) {
-                log.error("Failed to encode payload: {}", payload, e);
+                targetHost = TbNodeUtils.processPattern(hostKey, msg);
+                portStr = TbNodeUtils.processPattern(portKey, msg);
+            } catch (IllegalArgumentException iae) {
+                log.error("Failed to process pattern for host/port", iae);
                 ctx.tellFailure(msg,
-                        new IllegalArgumentException("Payload is not valid for type " + pt + ": " + e.getMessage()));
+                        new IllegalArgumentException("Failed to process pattern for host/port: " + iae.getMessage(), iae));
                 return;
             }
-        } catch (Exception e) {
-            log.error("TCP node failed to process message", e.fillInStackTrace());
-            ctx.tellFailure(msg, new TbNodeException("Unable to process message: " + e.getLocalizedMessage()));
-        }
+
+            int targetPort = 0;
+            try {
+                targetPort = Integer.parseInt(portStr);
+            } catch (Exception e) {
+                log.error("Message doesn't contain a valid port: {}", portStr);
+                ctx.tellFailure(msg, new IllegalArgumentException("Message doesn't contain a valid port: " + portStr));
+                return;
+            }
+            try {
+                javax.net.ssl.SSLSocketFactory sslFactory = null;
+                if (tls) {
+                    String caPem = tlsConfig.getCaCertificateKey() != null
+                            ? TbNodeUtils.processPattern(tlsConfig.getCaCertificateKey(), msg)
+                            : null;
+                    String certPem = tlsConfig.getCertificateKey() != null
+                            ? TbNodeUtils.processPattern(tlsConfig.getCertificateKey(), msg)
+                            : null;
+                    String keyPem = tlsConfig.getPrivateKeyKey() != null
+                            ? TbNodeUtils.processPattern(tlsConfig.getPrivateKeyKey(), msg)
+                            : null;
+                    String keyPassword = tlsConfig.getPrivateKeyPassphraseKey() != null
+                            ? TbNodeUtils.processPattern(tlsConfig.getPrivateKeyPassphraseKey(), msg)
+                            : null;
+                    boolean verifyServerCert = tlsConfig.getVerifyServerCertificate() == null
+                            || tlsConfig.getVerifyServerCertificate();
+                            
+                    String cacheKey = (caPem != null ? caPem : "") + "|" + 
+                                      (certPem != null ? certPem : "") + "|" + 
+                                      (keyPem != null ? keyPem : "") + "|" + 
+                                      (keyPassword != null ? keyPassword : "") + "|" + verifyServerCert;
+                    sslFactory = sslSocketFactoryCache.computeIfAbsent(cacheKey, k -> {
+                        try {
+                            return createSSLSocketFactoryFromPem(caPem, certPem, keyPem, keyPassword, verifyServerCert);
+                        } catch (Exception e) {
+                            throw new RuntimeException("Failed to create SSLSocketFactory", e);
+                        }
+                    });
+                }
+                TbMsgDataType pt = TbMsgDataType.valueOf(payloadType.toUpperCase());
+                TbMsgDataType rt = TbMsgDataType.valueOf(responseType.toUpperCase());
+                
+                String payload = null;
+                try {
+                    com.fasterxml.jackson.databind.JsonNode dataNode = com.fasterxml.jackson.databind.node.NullNode
+                            .getInstance();
+                    if (msg.getData() != null && !msg.getData().isEmpty()) {
+                        dataNode = MAPPER.readTree(msg.getData());
+                    }
+                    if (dataNode.has("payload")) {
+                        payload = dataNode.get("payload").asText();
+                    }
+                } catch (Exception ex) {
+                    log.error("Failed to parse message data for 'payload' key", ex);
+                    ctx.tellFailure(msg, new IllegalArgumentException(
+                            "Failed to parse message data for 'payload' key: " + ex.getMessage()));
+                    return;
+                }
+                if (payload == null) {
+                    log.error("No 'payload' key found in msg data");
+                    ctx.tellFailure(msg, new IllegalArgumentException("No 'payload' key found in msg data"));
+                    return;
+                }
+                
+                TbTcpClient client = null;
+                try {
+                    client = pool.borrowClient(targetHost, targetPort, tls, sslFactory);
+                    client.setFramingSettings(config);
+                    String response = client.sendRequest(payload, pt, rt);
+
+                    // Convert response to a TbMsg
+                    TbMsg responseMsg = msg.transform()
+                            .data(response)
+                            .dataType(rt) // Keep original response type
+                            .build();
+                    log.debug("Received TCP response: {}", response);
+                    
+                    pool.returnClient(client, targetHost, targetPort);
+                    ctx.tellSuccess(responseMsg);
+                } catch (Exception e) {
+                    log.error("Failed to send TCP request", e);
+                    if (client != null) {
+                        pool.discardClient(client, targetHost, targetPort);
+                    }
+                    ctx.tellFailure(msg, new IllegalArgumentException("Failed to send TCP request: " + e.getMessage(), e));
+                }
+            } catch (Exception e) {
+                log.error("TCP node failed to process message", e.fillInStackTrace());
+                ctx.tellFailure(msg, new TbNodeException("Unable to process message: " + e.getLocalizedMessage()));
+            }
+        });
     }
 
     // Helper: create SSLSocketFactory from PEM strings (CA, client cert, private
@@ -393,8 +470,5 @@ public class TbSendToTcpNode implements TbNode {
         return result;
     }
 
-    @Override
-    public void destroy() {
-        // No resources to clean up
-    }
+
 }

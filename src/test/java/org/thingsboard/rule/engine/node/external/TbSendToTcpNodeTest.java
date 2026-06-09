@@ -20,6 +20,9 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.doAnswer;
+
+import org.thingsboard.common.util.ListeningExecutor;
 
 import java.util.UUID;
 import org.thingsboard.server.common.data.id.DeviceId;
@@ -45,6 +48,12 @@ public class TbSendToTcpNodeTest {
     public void setup() throws TbNodeException {
         node = new TbSendToTcpNode();
         ctx = mock(TbContext.class);
+        ListeningExecutor executor = mock(ListeningExecutor.class);
+        doAnswer(invocation -> {
+            ((Runnable) invocation.getArgument(0)).run();
+            return null;
+        }).when(executor).execute(any(Runnable.class));
+        when(ctx.getExternalCallExecutor()).thenReturn(executor);
         TbSendToTcpNodeConfiguration config = new TbSendToTcpNodeConfiguration();
         config.setHostKey("${tcpHost}");
         config.setPortKey("${tcpPort}");
@@ -71,7 +80,7 @@ public class TbSendToTcpNodeTest {
                         .thenReturn("{\"response\":\"string\"}");
             } catch (java.io.IOException ignored) {
             }
-            TbSendToTcpNode.clientFactory = (h, p, t, ssl, ct, rt) -> mockClient;
+            TbSendToTcpNode.clientFactory = (h, p, t, ssl, ct, rt, ka) -> mockClient;
 
             TbMsgMetaData localMeta = new TbMsgMetaData();
             localMeta.putValue("tcpHost", "3.109.15.103");
@@ -120,7 +129,7 @@ public class TbSendToTcpNodeTest {
                         .thenReturn("{\"response\":{\"key\":\"value\"}}");
             } catch (java.io.IOException ignored) {
             }
-            TbSendToTcpNode.clientFactory = (h, p, t, ssl, ct, rt) -> mockClient;
+            TbSendToTcpNode.clientFactory = (h, p, t, ssl, ct, rt, ka) -> mockClient;
 
             TbMsgMetaData localMeta = new TbMsgMetaData();
             localMeta.putValue("tcpHost", "3.109.15.103");
@@ -171,7 +180,7 @@ public class TbSendToTcpNodeTest {
                         .thenReturn("{\"response\":\"eqcADcABwQAHAQBeWwD/AgA=\"}");
             } catch (java.io.IOException ignored) {
             }
-            TbSendToTcpNode.clientFactory = (h, p, t, ssl, ct, rt) -> mockClient;
+            TbSendToTcpNode.clientFactory = (h, p, t, ssl, ct, rt, ka) -> mockClient;
 
             TbMsgMetaData localMeta = new TbMsgMetaData();
             localMeta.putValue("tcpHost", "3.109.15.103");
@@ -227,7 +236,7 @@ public class TbSendToTcpNodeTest {
                         .thenReturn("{\"response\":\"test over tls\"}");
             } catch (java.io.IOException ignored) {
             }
-            TbSendToTcpNode.clientFactory = (h, p, t, ssl, ct, rt) -> mockClient;
+            TbSendToTcpNode.clientFactory = (h, p, t, ssl, ct, rt, ka) -> mockClient;
             TbMsgMetaData localMeta = new TbMsgMetaData();
             localMeta.putValue("tcpHost", "3.109.15.103");
             localMeta.putValue("tcpPort", "10550");
@@ -399,5 +408,316 @@ public class TbSendToTcpNodeTest {
         when(msg.getData()).thenReturn("[\"test\"]");
         node.onMsg(ctx, msg);
         verify(ctx).tellFailure(eq(msg), any(Exception.class));
+    }
+
+    // ── Framing Tests ───────────────────────────────────────────────────
+
+    @Test
+    public void testFramingNone_SmartTimeout_FragmentedResponse() throws Exception {
+        // Start a local TCP server that sends a response in two fragments with a gap
+        java.net.ServerSocket server = new java.net.ServerSocket(0);
+        int serverPort = server.getLocalPort();
+        Thread serverThread = new Thread(() -> {
+            try (java.net.Socket client = server.accept()) {
+                java.io.InputStream in = client.getInputStream();
+                byte[] buf = new byte[1024];
+                int n = in.read(buf); // consume request
+                java.io.OutputStream out = client.getOutputStream();
+                // Fragment 1
+                out.write("{\"response\":\"hel".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                out.flush();
+                Thread.sleep(10); // simulate network delay
+                // Fragment 2
+                out.write("lo\"}".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                out.flush();
+            } catch (Exception ignored) {}
+        });
+        serverThread.setDaemon(true);
+        serverThread.start();
+
+        TbSendToTcpNode.ClientFactory originalFactory = TbSendToTcpNode.clientFactory;
+        try {
+            TbSendToTcpNode.clientFactory = (h, p, t, ssl, ct, rt, ka) ->
+                    new TbTcpClient(h, p, t, ssl, ct, rt, ka);
+
+            TbMsgMetaData localMeta = new TbMsgMetaData();
+            localMeta.putValue("tcpHost", "127.0.0.1");
+            localMeta.putValue("tcpPort", String.valueOf(serverPort));
+            TbSendToTcpNodeConfiguration config = new TbSendToTcpNodeConfiguration();
+            config.setHostKey("${tcpHost}");
+            config.setPortKey("${tcpPort}");
+            config.setTls(false);
+            config.setPayloadType("TEXT");
+            config.setResponseType("TEXT");
+            config.setFramingType("NONE");
+            config.setFragmentTimeoutMs(100);
+            config.setKeepAlive(false);
+            ObjectMapper mapper = new ObjectMapper();
+            JsonNode json = mapper.valueToTree(config);
+            org.thingsboard.rule.engine.api.TbNodeConfiguration tbNodeConfig =
+                    new org.thingsboard.rule.engine.api.TbNodeConfiguration(json);
+            TbSendToTcpNode testNode = new TbSendToTcpNode();
+            testNode.init(ctx, tbNodeConfig);
+
+            msg = TbMsg.newMsg().data("{\"payload\":\"request\"}")
+                    .metaData(localMeta)
+                    .originator(new DeviceId(UUID.randomUUID())).build();
+            testNode.onMsg(ctx, msg);
+            verify(ctx).tellSuccess(
+                    org.mockito.ArgumentMatchers.argThat(m -> {
+                        try {
+                            com.fasterxml.jackson.databind.JsonNode node =
+                                    new ObjectMapper().readTree(m.getData());
+                            return node.has("response")
+                                    && node.get("response").asText().contains("hello");
+                        } catch (Exception e) {
+                            return false;
+                        }
+                    }));
+            testNode.destroy();
+        } finally {
+            TbSendToTcpNode.clientFactory = originalFactory;
+            server.close();
+        }
+    }
+
+    @Test
+    public void testFramingDelimiter_NewlineTerminated() throws Exception {
+        java.net.ServerSocket server = new java.net.ServerSocket(0);
+        int serverPort = server.getLocalPort();
+        Thread serverThread = new Thread(() -> {
+            try (java.net.Socket client = server.accept()) {
+                java.io.InputStream in = client.getInputStream();
+                byte[] buf = new byte[1024];
+                in.read(buf);
+                java.io.OutputStream out = client.getOutputStream();
+                out.write("hello-delim\n".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                out.flush();
+            } catch (Exception ignored) {}
+        });
+        serverThread.setDaemon(true);
+        serverThread.start();
+
+        TbSendToTcpNode.ClientFactory originalFactory = TbSendToTcpNode.clientFactory;
+        try {
+            TbSendToTcpNode.clientFactory = (h, p, t, ssl, ct, rt, ka) ->
+                    new TbTcpClient(h, p, t, ssl, ct, rt, ka);
+
+            TbMsgMetaData localMeta = new TbMsgMetaData();
+            localMeta.putValue("tcpHost", "127.0.0.1");
+            localMeta.putValue("tcpPort", String.valueOf(serverPort));
+            TbSendToTcpNodeConfiguration config = new TbSendToTcpNodeConfiguration();
+            config.setHostKey("${tcpHost}");
+            config.setPortKey("${tcpPort}");
+            config.setTls(false);
+            config.setPayloadType("TEXT");
+            config.setResponseType("TEXT");
+            config.setFramingType("DELIMITER");
+            config.setDelimiter("\\n");
+            config.setKeepAlive(false);
+            ObjectMapper mapper = new ObjectMapper();
+            JsonNode json = mapper.valueToTree(config);
+            org.thingsboard.rule.engine.api.TbNodeConfiguration tbNodeConfig =
+                    new org.thingsboard.rule.engine.api.TbNodeConfiguration(json);
+            TbSendToTcpNode testNode = new TbSendToTcpNode();
+            testNode.init(ctx, tbNodeConfig);
+
+            msg = TbMsg.newMsg().data("{\"payload\":\"request\"}")
+                    .metaData(localMeta)
+                    .originator(new DeviceId(UUID.randomUUID())).build();
+            testNode.onMsg(ctx, msg);
+            verify(ctx).tellSuccess(
+                    org.mockito.ArgumentMatchers.argThat(m -> {
+                        try {
+                            com.fasterxml.jackson.databind.JsonNode node =
+                                    new ObjectMapper().readTree(m.getData());
+                            return node.has("response")
+                                    && "hello-delim".equals(node.get("response").asText());
+                        } catch (Exception e) {
+                            return false;
+                        }
+                    }));
+            testNode.destroy();
+        } finally {
+            TbSendToTcpNode.clientFactory = originalFactory;
+            server.close();
+        }
+    }
+
+    @Test
+    public void testFramingLengthPrefix_4ByteBigEndian() throws Exception {
+        java.net.ServerSocket server = new java.net.ServerSocket(0);
+        int serverPort = server.getLocalPort();
+        Thread serverThread = new Thread(() -> {
+            try (java.net.Socket client = server.accept()) {
+                java.io.InputStream in = client.getInputStream();
+                byte[] buf = new byte[1024];
+                in.read(buf);
+                java.io.OutputStream out = client.getOutputStream();
+                // Send 4-byte big-endian length prefix + payload
+                byte[] payload = "length-ok".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                java.nio.ByteBuffer lenBuf = java.nio.ByteBuffer.allocate(4);
+                lenBuf.order(java.nio.ByteOrder.BIG_ENDIAN);
+                lenBuf.putInt(payload.length);
+                out.write(lenBuf.array());
+                out.write(payload);
+                out.flush();
+            } catch (Exception ignored) {}
+        });
+        serverThread.setDaemon(true);
+        serverThread.start();
+
+        TbSendToTcpNode.ClientFactory originalFactory = TbSendToTcpNode.clientFactory;
+        try {
+            TbSendToTcpNode.clientFactory = (h, p, t, ssl, ct, rt, ka) ->
+                    new TbTcpClient(h, p, t, ssl, ct, rt, ka);
+
+            TbMsgMetaData localMeta = new TbMsgMetaData();
+            localMeta.putValue("tcpHost", "127.0.0.1");
+            localMeta.putValue("tcpPort", String.valueOf(serverPort));
+            TbSendToTcpNodeConfiguration config = new TbSendToTcpNodeConfiguration();
+            config.setHostKey("${tcpHost}");
+            config.setPortKey("${tcpPort}");
+            config.setTls(false);
+            config.setPayloadType("TEXT");
+            config.setResponseType("TEXT");
+            config.setFramingType("LENGTH_PREFIX");
+            config.setMaxFrameLength(1048576);
+            config.setLengthFieldOffset(0);
+            config.setLengthFieldLength(4);
+            config.setLengthAdjustment(0);
+            config.setInitialBytesToStrip(4); // strip the 4-byte header
+            config.setLengthByteOrder("BIG_ENDIAN");
+            config.setKeepAlive(false);
+            ObjectMapper mapper = new ObjectMapper();
+            JsonNode json = mapper.valueToTree(config);
+            org.thingsboard.rule.engine.api.TbNodeConfiguration tbNodeConfig =
+                    new org.thingsboard.rule.engine.api.TbNodeConfiguration(json);
+            TbSendToTcpNode testNode = new TbSendToTcpNode();
+            testNode.init(ctx, tbNodeConfig);
+
+            msg = TbMsg.newMsg().data("{\"payload\":\"request\"}")
+                    .metaData(localMeta)
+                    .originator(new DeviceId(UUID.randomUUID())).build();
+            testNode.onMsg(ctx, msg);
+            verify(ctx).tellSuccess(
+                    org.mockito.ArgumentMatchers.argThat(m -> {
+                        try {
+                            com.fasterxml.jackson.databind.JsonNode node =
+                                    new ObjectMapper().readTree(m.getData());
+                            return node.has("response")
+                                    && "length-ok".equals(node.get("response").asText());
+                        } catch (Exception e) {
+                            return false;
+                        }
+                    }));
+            testNode.destroy();
+        } finally {
+            TbSendToTcpNode.clientFactory = originalFactory;
+            server.close();
+        }
+    }
+
+    @Test
+    public void testFramingNone_RetryOnStaleConnection() throws Exception {
+        java.net.ServerSocket server = new java.net.ServerSocket(0);
+        int serverPort = server.getLocalPort();
+        java.util.concurrent.atomic.AtomicInteger connectionCount = new java.util.concurrent.atomic.AtomicInteger(0);
+
+        Thread serverThread = new Thread(() -> {
+            try {
+                // Connection 1: Accept, read request, and close socket immediately (EOF)
+                try (java.net.Socket client = server.accept()) {
+                    connectionCount.incrementAndGet();
+                    java.io.InputStream in = client.getInputStream();
+                    byte[] buf = new byte[1024];
+                    in.read(buf); // consume request
+                }
+                
+                // Connection 2: Accept retry, read request, and send response
+                try (java.net.Socket client = server.accept()) {
+                    connectionCount.incrementAndGet();
+                    java.io.InputStream in = client.getInputStream();
+                    byte[] buf = new byte[1024];
+                    in.read(buf); // consume request
+                    java.io.OutputStream out = client.getOutputStream();
+                    out.write("ok".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                    out.flush();
+                }
+            } catch (Exception ignored) {}
+        });
+        serverThread.setDaemon(true);
+        serverThread.start();
+
+        TbSendToTcpNode.ClientFactory originalFactory = TbSendToTcpNode.clientFactory;
+        try {
+            TbSendToTcpNode.clientFactory = (h, p, t, ssl, ct, rt, ka) ->
+                    new TbTcpClient(h, p, t, ssl, ct, rt, ka);
+
+            TbMsgMetaData localMeta = new TbMsgMetaData();
+            localMeta.putValue("tcpHost", "127.0.0.1");
+            localMeta.putValue("tcpPort", String.valueOf(serverPort));
+            TbSendToTcpNodeConfiguration config = new TbSendToTcpNodeConfiguration();
+            config.setHostKey("${tcpHost}");
+            config.setPortKey("${tcpPort}");
+            config.setTls(false);
+            config.setPayloadType("TEXT");
+            config.setResponseType("TEXT");
+            config.setFramingType("NONE");
+            config.setFragmentTimeoutMs(50);
+            config.setKeepAlive(true);
+            ObjectMapper mapper = new ObjectMapper();
+            JsonNode json = mapper.valueToTree(config);
+            org.thingsboard.rule.engine.api.TbNodeConfiguration tbNodeConfig =
+                    new org.thingsboard.rule.engine.api.TbNodeConfiguration(json);
+            TbSendToTcpNode testNode = new TbSendToTcpNode();
+            testNode.init(ctx, tbNodeConfig);
+
+            msg = TbMsg.newMsg().data("{\"payload\":\"request\"}")
+                    .metaData(localMeta)
+                    .originator(new DeviceId(UUID.randomUUID())).build();
+            testNode.onMsg(ctx, msg);
+
+            verify(ctx).tellSuccess(
+                    org.mockito.ArgumentMatchers.argThat(m -> {
+                        try {
+                            com.fasterxml.jackson.databind.JsonNode node =
+                                    new ObjectMapper().readTree(m.getData());
+                            return node.has("response")
+                                    && "ok".equals(node.get("response").asText());
+                        } catch (Exception e) {
+                            return false;
+                        }
+                    }));
+
+            org.junit.jupiter.api.Assertions.assertEquals(2, connectionCount.get());
+            testNode.destroy();
+        } finally {
+            TbSendToTcpNode.clientFactory = originalFactory;
+            server.close();
+        }
+    }
+
+    @Test
+    public void testResolveDelimiterBytes() {
+        // Newline escape
+        byte[] nl = TbTcpClient.resolveDelimiterBytes("\\n");
+        org.junit.jupiter.api.Assertions.assertArrayEquals(new byte[]{'\n'}, nl);
+
+        // CRLF
+        byte[] crlf = TbTcpClient.resolveDelimiterBytes("\\r\\n");
+        org.junit.jupiter.api.Assertions.assertArrayEquals(new byte[]{'\r', '\n'}, crlf);
+
+        // Null byte via unicode
+        byte[] nul = TbTcpClient.resolveDelimiterBytes("\\u0000");
+        org.junit.jupiter.api.Assertions.assertArrayEquals(new byte[]{0}, nul);
+
+        // Literal string (no escapes)
+        byte[] lit = TbTcpClient.resolveDelimiterBytes("END");
+        org.junit.jupiter.api.Assertions.assertArrayEquals("END".getBytes(java.nio.charset.StandardCharsets.UTF_8), lit);
+
+        // Null/empty defaults to newline
+        byte[] def = TbTcpClient.resolveDelimiterBytes(null);
+        org.junit.jupiter.api.Assertions.assertArrayEquals(new byte[]{'\n'}, def);
     }
 }

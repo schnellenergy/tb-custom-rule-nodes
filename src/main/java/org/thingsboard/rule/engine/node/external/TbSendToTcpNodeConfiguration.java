@@ -28,14 +28,10 @@ public class TbSendToTcpNodeConfiguration implements NodeConfiguration<TbSendToT
      * Templatized key for the target port (e.g., "${tcpPort}" or "$[tcpPort]").
      */
     private String portKey;
-    /**
-     * TCP connect timeout (ms)
-     */
     private int connectTimeout;
-    /**
-     * TCP read timeout (ms)
-     */
     private int readTimeout;
+    private int maxConnections = 10;
+    private boolean keepAlive = true;
     /**
      * Enable TLS
      */
@@ -49,6 +45,31 @@ public class TbSendToTcpNodeConfiguration implements NodeConfiguration<TbSendToT
      * Response type: STRING, JSON, BINARY
      */
     private String responseType; // STRING, JSON, BINARY
+
+    /**
+     * Framing type: NONE, DELIMITER, LENGTH_PREFIX
+     */
+    private String framingType;
+
+    /**
+     * Delimiter string (e.g. \n or \r\n)
+     */
+    private String delimiter;
+
+    /**
+     * Netty-style length-prefix settings
+     */
+    private int maxFrameLength;
+    private int lengthFieldOffset;
+    private int lengthFieldLength;
+    private int lengthAdjustment;
+    private int initialBytesToStrip;
+    private String lengthByteOrder;
+
+    /**
+     * Fragment smart timeout settings
+     */
+    private int fragmentTimeoutMs;
 
     /**
      * TLS configuration (PEM or Keystore/Truststore, SNI, ALPN, etc).
@@ -99,8 +120,19 @@ public class TbSendToTcpNodeConfiguration implements NodeConfiguration<TbSendToT
         config.setResponseType("TEXT");
         config.setConnectTimeout(1000);
         config.setReadTimeout(5000);
+        config.setMaxConnections(10);
+        config.setKeepAlive(true);
         config.setTls(false);
         config.setTlsConfig(new TlsConfig());
+        config.setFramingType("NONE");
+        config.setDelimiter("\\n");
+        config.setMaxFrameLength(1048576);
+        config.setLengthFieldOffset(0);
+        config.setLengthFieldLength(4);
+        config.setLengthAdjustment(0);
+        config.setInitialBytesToStrip(0);
+        config.setLengthByteOrder("BIG_ENDIAN");
+        config.setFragmentTimeoutMs(50);
         return config;
     }
 }
