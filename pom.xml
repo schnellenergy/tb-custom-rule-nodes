@@ -32,7 +32,7 @@
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <main.dir>${basedir}</main.dir>
-        <thingsboard.version>4.1.0</thingsboard.version>
+        <thingsboard.version>4.2.0PE</thingsboard.version>
         <lombok.version>1.18.32</lombok.version>
         <guava.version>33.1.0-jre</guava.version>
         <!--         TEST SCOPE         -->
@@ -138,6 +138,17 @@
             <version>${protobuf.version}</version>
             <scope>test</scope>
         </dependency>
+         <!-- GURUX DLMS Dependencies -->
+        <dependency>
+            <groupId>org.gurux</groupId>
+            <artifactId>gurux.dlms</artifactId>
+            <version>4.0.81</version>
+        </dependency>
+        <dependency>
+            <groupId>org.gurux</groupId>
+            <artifactId>gurux.net</artifactId>
+            <version>1.0.28</version>
+        </dependency>
     </dependencies>
 
     <build>
@@ -176,6 +187,7 @@
                 <configuration>
                     <descriptors>
                         <descriptor>src/assembly/rule-node.xml</descriptor>
+                        <!--<descriptor>src/assembly/dlms-node.xml</descriptor>-->
                     </descriptors>
                 </configuration>
                 <executions>
