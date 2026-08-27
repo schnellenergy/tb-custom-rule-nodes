@@ -112,8 +112,25 @@ public class GXDLMSSecureClient2 extends GXDLMSClient {
             // Set HLSE (GMAC) authentication mode
             this.setAuthentication(Authentication.HIGH_GMAC);
 
-            // Set encryption and authentication keys via Gurux settings
-            // (actual configuration happens through Gurux library internals)
+            // Wire keys into Gurux's ciphering engine (CRITICAL - was missing before)
+            // Access via protected GXDLMSSettings.settings.getCipher()
+            // These keys are NOT local variables — they must be set on the client's cipher object
+            // for the AARQ/AARE handshake and secured GET/SET/ACTION to work
+            if (this.settings != null) {
+                try {
+                    this.settings.getCipher().setBlockCipherKey(cipherKey);
+                    this.settings.getCipher().setAuthenticationKey(authKey);
+                    this.settings.getCipher().setSystemTitle(sysTitle);
+                    log.debug("HLSE keys wired to Gurux cipher: EK({}B) AK({}B) systemTitle({}B)",
+                            cipherKey.length, authKey.length, sysTitle.length);
+                } catch (Exception e) {
+                    log.warn("Failed to wire HLSE keys to Gurux cipher: {}", e.getMessage());
+                    throw new Exception("Failed to set cipher keys: " + e.getMessage(), e);
+                }
+            } else {
+                throw new IllegalStateException("GXDLMSSettings not initialized");
+            }
+
             log.debug("HLSE authentication configured with GMAC mode");
         } catch (Exception e) {
             log.error("Failed to configure HLSE: {}", e.getMessage(), e);
