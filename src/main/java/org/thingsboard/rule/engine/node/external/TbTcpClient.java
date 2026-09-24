@@ -21,6 +21,7 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.ConnectException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketException;
@@ -40,6 +41,19 @@ import org.thingsboard.server.common.msg.TbMsgDataType;
 /**
  * TCP client for ThingsBoard Rule Engine nodes with configurable response
  * framing strategies: NONE (smart timeout), DELIMITER, and LENGTH_PREFIX.
+ *
+ * <p>Changes for SmartLights_2.0 issues #4433 / #4434 / #4435:
+ * <ul>
+ *   <li>Per-call {@code connectTimeoutMs} / {@code readTimeoutMs} — derived
+ *       from {@code rpcTimeoutMs} metadata by the node; stored defaults are
+ *       used only as fallback.</li>
+ *   <li>All I/O errors are phase-classified ({@link TbTcpException}) and close
+ *       the socket immediately to prevent stale-socket reuse.</li>
+ *   <li>Read-timeout never triggers a blind reconnect-and-retry; that decision
+ *       belongs to the pool.</li>
+ *   <li>Per-phase timing ({@code connectMs}, {@code writeMs}, {@code readMs})
+ *       exposed for metadata enrichment.</li>
+ * </ul>
  */
 public class TbTcpClient {
 
@@ -49,8 +63,10 @@ public class TbTcpClient {
     private final int port;
     private final boolean tls;
     private final SSLSocketFactory sslSocketFactory;
-    private final int connectTimeoutMs;
-    private final int readTimeoutMs;
+    /** Static fallback connect timeout (ms) used when no per-call value is supplied. */
+    private final int defaultConnectTimeoutMs;
+    /** Static fallback read timeout (ms) used when no per-call value is supplied. */
+    private final int defaultReadTimeoutMs;
     private final boolean keepAlive;
 
     private Socket socket;
@@ -70,14 +86,29 @@ public class TbTcpClient {
     private int initialBytesToStrip = 0;
     private ByteOrder lengthByteOrder = ByteOrder.BIG_ENDIAN;
 
+    // ── Per-phase timing (ms) from the last sendRequest call ─────────────
+    private long lastConnectMs = -1;
+    private long lastWriteMs = -1;
+    private long lastReadMs = -1;
+
+    private volatile int currentConnectTimeoutMs = -1;
+    private volatile int currentReadTimeoutMs = -1;
+    private volatile String currentCmdId = null;
+
+    public void setInvocationContext(int connectTimeoutMs, int readTimeoutMs, String cmdId) {
+        this.currentConnectTimeoutMs = connectTimeoutMs;
+        this.currentReadTimeoutMs = readTimeoutMs;
+        this.currentCmdId = cmdId;
+    }
+
     public TbTcpClient(String host, int port, boolean tls, SSLSocketFactory sslSocketFactory, int connectTimeoutMs,
             int readTimeoutMs, boolean keepAlive) {
         this.host = host;
         this.port = port;
         this.tls = tls;
         this.sslSocketFactory = sslSocketFactory;
-        this.connectTimeoutMs = connectTimeoutMs;
-        this.readTimeoutMs = readTimeoutMs;
+        this.defaultConnectTimeoutMs = connectTimeoutMs;
+        this.defaultReadTimeoutMs = readTimeoutMs;
         this.keepAlive = keepAlive;
     }
 
@@ -110,20 +141,52 @@ public class TbTcpClient {
     }
 
     /**
-     * Connects to the server if not already connected.
+     * Connects to the server using the default (static fallback) timeouts.
      */
-    public void connect() throws IOException {
+    public void connect() throws TbTcpException {
+        connect(defaultConnectTimeoutMs, defaultReadTimeoutMs);
+    }
+
+    /**
+     * Connects to the server using the supplied per-call timeout values.
+     * Classifies {@link ConnectException} as a {@code CONNECT}-phase
+     * {@link TbTcpException} so callers can route to the correct failure chain.
+     *
+     * @param connectTimeoutMs TCP handshake budget in milliseconds
+     * @param readTimeoutMs    SO_TIMEOUT for subsequent reads in milliseconds
+     * @throws TbTcpException on any connection failure
+     */
+    public void connect(int connectTimeoutMs, int readTimeoutMs) throws TbTcpException {
         if (socket != null && !socket.isClosed() && socket.isConnected()) {
             return;
         }
+        long t0 = System.currentTimeMillis();
+        String target = host + ":" + port;
+        try {
+            socket = tls && sslSocketFactory != null ? sslSocketFactory.createSocket()
+                    : SocketFactory.getDefault().createSocket();
 
-        socket = tls && sslSocketFactory != null ? sslSocketFactory.createSocket()
-                : SocketFactory.getDefault().createSocket();
-
-        socket.setKeepAlive(keepAlive);
-        socket.connect(new InetSocketAddress(host, port), connectTimeoutMs);
-        socket.setSoTimeout(readTimeoutMs);
-        bufferedIn = new BufferedInputStream(socket.getInputStream(), 8192);
+            socket.setKeepAlive(keepAlive);
+            socket.connect(new InetSocketAddress(host, port), connectTimeoutMs);
+            socket.setSoTimeout(readTimeoutMs);
+            bufferedIn = new BufferedInputStream(socket.getInputStream(), 8192);
+            lastConnectMs = System.currentTimeMillis() - t0;
+        } catch (ConnectException ce) {
+            lastConnectMs = System.currentTimeMillis() - t0;
+            safeClose();
+            throw new TbTcpException("CONNECT", "ConnectException",
+                    "Connection refused to " + target + ": " + ce.getMessage(), target, null, ce);
+        } catch (SocketTimeoutException ste) {
+            lastConnectMs = System.currentTimeMillis() - t0;
+            safeClose();
+            throw new TbTcpException("CONNECT", "SocketTimeoutException",
+                    "Connect timed out to " + target + " after " + connectTimeoutMs + " ms", target, null, ste);
+        } catch (IOException ioe) {
+            lastConnectMs = System.currentTimeMillis() - t0;
+            safeClose();
+            throw new TbTcpException("CONNECT", ioe.getClass().getSimpleName(),
+                    "Connect I/O error to " + target + ": " + ioe.getMessage(), target, null, ioe);
+        }
     }
 
     /**
@@ -135,9 +198,13 @@ public class TbTcpClient {
     }
 
     /**
-     * Closes the active connection.
+     * Closes the active connection silently.
      */
     public void close() {
+        safeClose();
+    }
+
+    private void safeClose() {
         bufferedIn = null;
         if (socket != null) {
             try {
@@ -150,54 +217,126 @@ public class TbTcpClient {
     }
 
     /**
-     * Sends the payload and returns the response as bytes.
-     * Reconnects once if the pooled connection was closed by the remote end.
+     * Sends the payload using the default (static fallback) timeouts.
+     * A {@link SocketTimeoutException} on read is classified as a {@code READ}-phase
+     * failure and closes the socket — no automatic reconnect-and-retry is attempted
+     * for write operations to prevent double-apply.
      */
-    public byte[] sendRequest(byte[] payload) throws IOException {
-        if (!isValid()) {
-            connect();
-        }
+    public byte[] sendRequest(byte[] payload) throws TbTcpException, IOException {
+        int ct = currentConnectTimeoutMs > 0 ? currentConnectTimeoutMs : defaultConnectTimeoutMs;
+        int rt = currentReadTimeoutMs > 0 ? currentReadTimeoutMs : defaultReadTimeoutMs;
+        return sendRequest(payload, ct, rt, currentCmdId);
+    }
+
+    /**
+     * Sends the payload using the supplied per-call timeout values.
+     *
+     * @param payload          raw bytes to send
+     * @param connectTimeoutMs TCP handshake budget
+     * @param readTimeoutMs    read budget
+     * @param cmdId            optional command correlation ID for error enrichment
+     * @throws TbTcpException on classified TCP errors (CONNECT / WRITE / READ)
+     * @throws IOException    on unclassified I/O errors
+     */
+    public byte[] sendRequest(byte[] payload, int connectTimeoutMs, int readTimeoutMs, String cmdId)
+            throws TbTcpException, IOException {
         try {
-            return doSend(payload);
+            return doSendOnce(payload, connectTimeoutMs, readTimeoutMs, cmdId);
         } catch (SocketException | EOFException e) {
             // Stale pooled connection — remote closed it; reconnect and retry once
-            close();
-            connect();
-            return doSend(payload);
+            safeClose();
+            try {
+                return doSendOnce(payload, connectTimeoutMs, readTimeoutMs, cmdId);
+            } catch (SocketException | EOFException retryEx) {
+                String target = host + ":" + port;
+                safeClose();
+                throw new TbTcpException("READ", retryEx.getClass().getSimpleName(),
+                        "Connection closed by " + target + " (EOF/Reset): " + retryEx.getMessage(), target, cmdId, retryEx);
+            }
         }
     }
 
-    // ── Core send + framed read ─────────────────────────────────────────
+    private byte[] doSendOnce(byte[] payload, int connectTimeoutMs, int readTimeoutMs, String cmdId)
+            throws TbTcpException, IOException {
+        String target = host + ":" + port;
+        if (!isValid()) {
+            connect(connectTimeoutMs, readTimeoutMs);
+        } else {
+            // Update SO_TIMEOUT to the per-call value for this exchange
+            try {
+                socket.setSoTimeout(readTimeoutMs);
+            } catch (IOException ioe) {
+                safeClose();
+                throw new TbTcpException("CONNECT", ioe.getClass().getSimpleName(),
+                        "Failed to set SO_TIMEOUT on existing socket to " + target + ": " + ioe.getMessage(),
+                        target, cmdId, ioe);
+            }
+        }
 
-    private byte[] doSend(byte[] payload) throws IOException {
-        OutputStream out = socket.getOutputStream();
-        out.write(payload);
-        out.flush();
+        long t1 = System.currentTimeMillis();
+        try {
+            OutputStream out = socket.getOutputStream();
+            out.write(payload);
+            out.flush();
+            lastWriteMs = System.currentTimeMillis() - t1;
+        } catch (SocketException se) {
+            lastWriteMs = System.currentTimeMillis() - t1;
+            safeClose();
+            throw se;
+        } catch (IOException ioe) {
+            lastWriteMs = System.currentTimeMillis() - t1;
+            safeClose();
+            throw new TbTcpException("WRITE", ioe.getClass().getSimpleName(),
+                    "Write failed to " + target + ": " + ioe.getMessage(), target, cmdId, ioe);
+        }
 
-        byte[] response;
+        long t2 = System.currentTimeMillis();
+        try {
+            byte[] response = doRead(readTimeoutMs, target, cmdId);
+            lastReadMs = System.currentTimeMillis() - t2;
+            if (response == null || response.length == 0) {
+                safeClose();
+                throw new TbTcpException("READ", "NoResponse",
+                        "No response received from " + target, target, cmdId);
+            }
+            return response;
+        } catch (TbTcpException te) {
+            // Already classified — socket closed inside doRead; rethrow
+            lastReadMs = System.currentTimeMillis() - t2;
+            throw te;
+        } catch (SocketException | EOFException se) {
+            lastReadMs = System.currentTimeMillis() - t2;
+            safeClose();
+            throw se;
+        } catch (IOException ioe) {
+            lastReadMs = System.currentTimeMillis() - t2;
+            safeClose();
+            throw new TbTcpException("READ", ioe.getClass().getSimpleName(),
+                    "Read I/O error from " + target + ": " + ioe.getMessage(), target, cmdId, ioe);
+        }
+    }
+
+    // ── Core framed read ─────────────────────────────────────────────────
+
+    private byte[] doRead(int readTimeoutMs, String target, String cmdId) throws TbTcpException, IOException {
         if ("DELIMITER".equalsIgnoreCase(framingType)) {
-            response = readDelimiterFramed();
+            return readDelimiterFramed(target, cmdId);
         } else if ("LENGTH_PREFIX".equalsIgnoreCase(framingType)) {
-            response = readLengthPrefixFramed();
+            return readLengthPrefixFramed(target, cmdId);
         } else {
             // NONE — smart timeout
-            response = readSmartTimeout();
+            return readSmartTimeout(readTimeoutMs, target, cmdId);
         }
-
-        if (response == null || response.length == 0) {
-            throw new IOException("No response received from TCP server");
-        }
-        return response;
     }
 
     // ── NONE / Smart Timeout ────────────────────────────────────────────
 
     /**
-     * The first read blocks up to the full readTimeoutMs.
+     * The first read blocks up to the full readTimeoutMs (already set on socket).
      * Once data arrives, subsequent reads use a short fragmentTimeoutMs window.
-     * A SocketTimeoutException on the short window signals end-of-response.
+     * A SocketTimeoutException on the first read is classified as READ phase.
      */
-    private byte[] readSmartTimeout() throws IOException {
+    private byte[] readSmartTimeout(int readTimeoutMs, String target, String cmdId) throws TbTcpException, IOException {
         InputStream in = bufferedIn;
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
         byte[] tmp = new byte[4096];
@@ -207,11 +346,13 @@ public class TbTcpClient {
         try {
             len = in.read(tmp);
         } catch (SocketTimeoutException e) {
-            // No data at all within readTimeoutMs
-            return new byte[0];
+            safeClose();
+            throw new TbTcpException("READ", "SocketTimeoutException",
+                    "Read timed out from " + target + " after " + readTimeoutMs + " ms — no initial data", target, cmdId, e);
         }
         if (len == -1) {
-            throw new EOFException("Connection closed by peer (EOF)");
+            safeClose();
+            throw new EOFException("Connection closed by " + target + " before response (EOF)");
         }
         buf.write(tmp, 0, len);
 
@@ -223,7 +364,7 @@ public class TbTcpClient {
                 try {
                     len = in.read(tmp);
                     if (len == -1) {
-                        break; // remote closed
+                        break; // remote closed — response complete
                     }
                     buf.write(tmp, 0, len);
                 } catch (SocketTimeoutException e) {
@@ -232,8 +373,12 @@ public class TbTcpClient {
                 }
             }
         } finally {
-            // Restore original timeout for the next request on this pooled connection
-            socket.setSoTimeout(originalTimeout);
+            // Restore per-call timeout for the next request on this pooled connection
+            if (socket != null) {
+                try {
+                    socket.setSoTimeout(originalTimeout);
+                } catch (IOException ignored) {}
+            }
         }
         return buf.toByteArray();
     }
@@ -244,19 +389,26 @@ public class TbTcpClient {
      * Reads byte-by-byte from the buffered stream until the delimiter
      * sequence is matched. Returns all bytes read EXCLUDING the delimiter.
      */
-    private byte[] readDelimiterFramed() throws IOException {
+    private byte[] readDelimiterFramed(String target, String cmdId) throws TbTcpException, IOException {
         InputStream in = bufferedIn;
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
         int matchIndex = 0;
 
         while (true) {
-            int b = in.read();
+            int b;
+            try {
+                b = in.read();
+            } catch (SocketTimeoutException e) {
+                safeClose();
+                throw new TbTcpException("READ", "SocketTimeoutException",
+                        "Read timed out waiting for delimiter from " + target, target, cmdId, e);
+            }
             if (b == -1) {
                 if (buf.size() == 0) {
-                    throw new EOFException("Connection closed by peer (EOF) before reading response");
+                    safeClose();
+                    throw new EOFException("Connection closed by " + target + " before receiving delimiter");
                 }
-                // Connection closed before delimiter; return what we have
-                break;
+                break; // Connection closed before delimiter; return what we have
             }
             buf.write(b);
 
@@ -270,7 +422,6 @@ public class TbTcpClient {
                     return result;
                 }
             } else {
-                // Reset match; check if current byte starts a new match
                 matchIndex = ((byte) b == delimiterBytes[0]) ? 1 : 0;
             }
         }
@@ -280,21 +431,25 @@ public class TbTcpClient {
     // ── LENGTH_PREFIX (Netty-style) ─────────────────────────────────────
 
     /**
-     * Reads a length-prefixed frame using Netty-style configuration:
-     *   lengthFieldOffset, lengthFieldLength, lengthAdjustment,
-     *   initialBytesToStrip, maxFrameLength, lengthByteOrder.
+     * Reads a length-prefixed frame using Netty-style configuration.
      */
-    private byte[] readLengthPrefixFramed() throws IOException {
+    private byte[] readLengthPrefixFramed(String target, String cmdId) throws TbTcpException, IOException {
         InputStream in = bufferedIn;
 
-        // 1. Read everything up to and including the length field
         int headerSize = lengthFieldOffset + lengthFieldLength;
         byte[] header = new byte[headerSize];
-        readFully(in, header, 0, headerSize);
+        try {
+            readFully(in, header, 0, headerSize);
+        } catch (SocketTimeoutException e) {
+            safeClose();
+            throw new TbTcpException("READ", "SocketTimeoutException",
+                    "Read timed out reading length-prefix header from " + target, target, cmdId, e);
+        } catch (EOFException e) {
+            safeClose();
+            throw e;
+        }
 
-        // 2. Decode the length value from the field
         long framePayloadLength = decodeLengthField(header, lengthFieldOffset, lengthFieldLength, lengthByteOrder);
-        // Apply adjustment (can be negative, e.g. if length includes the header itself)
         long totalRemaining = framePayloadLength + lengthAdjustment;
 
         if (totalRemaining < 0) {
@@ -306,14 +461,21 @@ public class TbTcpClient {
             throw new IOException("Frame length " + totalFrameSize + " exceeds maxFrameLength " + maxFrameLength);
         }
 
-        // 3. Read the remaining payload bytes
         byte[] fullFrame = new byte[(int) totalFrameSize];
         System.arraycopy(header, 0, fullFrame, 0, headerSize);
         if (totalRemaining > 0) {
-            readFully(in, fullFrame, headerSize, (int) totalRemaining);
+            try {
+                readFully(in, fullFrame, headerSize, (int) totalRemaining);
+            } catch (SocketTimeoutException e) {
+                safeClose();
+                throw new TbTcpException("READ", "SocketTimeoutException",
+                        "Read timed out reading frame body from " + target, target, cmdId, e);
+            } catch (EOFException e) {
+                safeClose();
+                throw e;
+            }
         }
 
-        // 4. Strip leading bytes as configured
         if (initialBytesToStrip > 0) {
             if (initialBytesToStrip > fullFrame.length) {
                 throw new IOException("initialBytesToStrip (" + initialBytesToStrip
@@ -333,7 +495,6 @@ public class TbTcpClient {
         if (fieldLength < 1 || fieldLength > 8) {
             throw new IOException("Unsupported lengthFieldLength: " + fieldLength + ". Must be 1..8");
         }
-        // Pad to 8 bytes for ByteBuffer
         byte[] padded = new byte[8];
         if (order == ByteOrder.BIG_ENDIAN) {
             System.arraycopy(header, offset, padded, 8 - fieldLength, fieldLength);
@@ -341,14 +502,14 @@ public class TbTcpClient {
             System.arraycopy(header, offset, padded, 0, fieldLength);
         }
         ByteBuffer bb = ByteBuffer.wrap(padded).order(order);
-        return bb.getLong() & 0x7FFF_FFFF_FFFF_FFFFL; // treat as unsigned
+        return bb.getLong() & 0x7FFF_FFFF_FFFF_FFFFL;
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────
 
     /**
-     * Reads exactly {@code len} bytes into {@code b} starting at {@code off}.
-     * Blocks until all bytes are read or throws EOFException.
+     * Reads exactly {@code len} bytes. Throws {@link EOFException} if stream
+     * ends before all bytes are read, or propagates {@link SocketTimeoutException}.
      */
     private void readFully(InputStream in, byte[] b, int off, int len) throws IOException {
         int n = 0;
@@ -411,13 +572,27 @@ public class TbTcpClient {
         return sb.toString().getBytes(StandardCharsets.UTF_8);
     }
 
-    // ── Public API (unchanged signatures) ───────────────────────────────
+    // ── Public API ───────────────────────────────────────────────────────
 
     /**
-     * Sends a string payload and returns the response as a string using
-     * TbMsgDataType.
+     * Sends a string payload using the static fallback timeouts and returns the
+     * response as a JSON-wrapped string.
      */
-    public String sendRequest(String payload, TbMsgDataType dataType, TbMsgDataType responseType) throws IOException {
+    public String sendRequest(String payload, TbMsgDataType dataType, TbMsgDataType responseType)
+            throws TbTcpException, IOException {
+        int ct = currentConnectTimeoutMs > 0 ? currentConnectTimeoutMs : defaultConnectTimeoutMs;
+        int rt = currentReadTimeoutMs > 0 ? currentReadTimeoutMs : defaultReadTimeoutMs;
+        return sendRequest(payload, dataType, responseType, ct, rt, currentCmdId);
+    }
+
+    /**
+     * Sends a string payload using per-call derived timeouts.
+     *
+     * @param cmdId optional command correlation ID included in any thrown {@link TbTcpException}
+     */
+    public String sendRequest(String payload, TbMsgDataType dataType, TbMsgDataType responseType,
+            int connectTimeoutMs, int readTimeoutMs, String cmdId) throws TbTcpException, IOException {
+        setInvocationContext(connectTimeoutMs, readTimeoutMs, cmdId);
         byte[] payloadBytes;
         if (dataType == null || "TEXT".equalsIgnoreCase(dataType.name())) {
             payloadBytes = payload.getBytes(StandardCharsets.UTF_8);
@@ -428,7 +603,7 @@ public class TbTcpClient {
         } else {
             payloadBytes = payload.getBytes(StandardCharsets.UTF_8);
         }
-        byte[] response = sendRequest(payloadBytes);
+        byte[] response = sendRequest(payloadBytes, connectTimeoutMs, readTimeoutMs, cmdId);
         ObjectNode node = MAPPER.createObjectNode();
         node.put("response", decodeResponse(response, responseType));
         return node.toString();
@@ -447,5 +622,21 @@ public class TbTcpClient {
         } else {
             return new String(response, StandardCharsets.UTF_8);
         }
+    }
+
+    /**
+     * Returns per-phase timings from the last {@link #sendRequest} call.
+     * Values are in milliseconds; {@code -1} means the phase was not reached.
+     */
+    public long[] getLastPhaseTimings() {
+        return new long[]{lastConnectMs, lastWriteMs, lastReadMs};
+    }
+
+    public String getHost() {
+        return host;
+    }
+
+    public int getPort() {
+        return port;
     }
 }
