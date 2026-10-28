@@ -15,16 +15,23 @@
  */
 package org.thingsboard.rule.engine.node.external;
 
-import gurux.dlms.GXDLMSClient;
+import gurux.dlms.GXICipher;
 import gurux.dlms.enums.Authentication;
+import gurux.dlms.enums.Security;
+import gurux.dlms.secure.GXCiphering;
+import gurux.dlms.secure.GXDLMSSecureClient;
 import lombok.extern.slf4j.Slf4j;
 
 /**
  * DLMS Secure Client (HLS/HLSE).
- * Wrapper around Gurux DLMS library's GXDLMSClient.
+ * Wrapper around Gurux DLMS library's GXDLMSSecureClient.
  * Handles DLMS protocol communication with security features.
  *
- * Extends: GXDLMSClient (Gurux's base DLMS implementation)
+ * Extends: gurux.dlms.secure.GXDLMSSecureClient (Gurux's secure DLMS implementation).
+ * NOTE: This is NOT the plain gurux.dlms.GXDLMSClient - that class never initializes
+ * a cipher (settings.getCipher() always returns null on it), so configureHLSE() would
+ * throw a NullPointerException on every call. Gurux's own secure client carries a
+ * non-null GXCiphering from construction, reachable via getCiphering().
  *
  * Security Types:
  * - NO_SECURITY: Plain communication
@@ -32,10 +39,10 @@ import lombok.extern.slf4j.Slf4j;
  * - HLSE: High Level Security Evolved (certificate-based with invocation counter)
  *
  * Note: All DLMS protocol implementation (GET/SET/ACTION requests, HDLC framing, CRC-16, etc.)
- * is provided by Gurux's GXDLMSClient. This class extends it for customization.
+ * is provided by Gurux's GXDLMSSecureClient. This class extends it for customization.
  */
 @Slf4j
-public class GXDLMSSecureClient2 extends GXDLMSClient {
+public class GXDLMSSecureClient2 extends GXDLMSSecureClient {
 
     private int invocationCounter;
 
@@ -72,11 +79,11 @@ public class GXDLMSSecureClient2 extends GXDLMSClient {
      * HLSE uses certificate-based authentication with AES-GCM encryption and GMAC signatures.
      *
      * Requires:
-     * - blockCipherKey (AES key for encryption, 128/256-bit)
+     * - blockCipherKey (AES-128 key for encryption, 16 bytes - Gurux's cipher rejects any other length)
      * - authenticationKey (HMAC key for authentication, 16 bytes)
      * - systemTitle (sender identification, 8 bytes hex encoded)
      *
-     * @param blockCipherKey AES encryption key as hex string
+     * @param blockCipherKey AES-128 encryption key as hex string (16 bytes)
      * @param authenticationKey HMAC authentication key as hex string
      * @param systemTitle Sender system title as hex string (8 bytes)
      * @throws Exception if configuration fails
@@ -98,9 +105,9 @@ public class GXDLMSSecureClient2 extends GXDLMSClient {
             byte[] authKey = hexStringToByteArray(authenticationKey);
             byte[] sysTitle = hexStringToByteArray(systemTitle);
 
-            // Validate key sizes
-            if (cipherKey.length != 16 && cipherKey.length != 32) {
-                throw new IllegalArgumentException("Block Cipher Key must be 16 or 32 bytes, got: " + cipherKey.length);
+            // Validate key sizes (Gurux's GXCiphering only accepts a 16-byte AES-128 block cipher key)
+            if (cipherKey.length != 16) {
+                throw new IllegalArgumentException("Block Cipher Key must be 16 bytes, got: " + cipherKey.length);
             }
             if (authKey.length != 16) {
                 throw new IllegalArgumentException("Authentication Key must be 16 bytes, got: " + authKey.length);
@@ -112,15 +119,23 @@ public class GXDLMSSecureClient2 extends GXDLMSClient {
             // Set HLSE (GMAC) authentication mode
             this.setAuthentication(Authentication.HIGH_GMAC);
 
-            // Wire keys into Gurux's ciphering engine (CRITICAL - was missing before)
-            // Access via protected GXDLMSSettings.settings.getCipher()
-            // These keys are NOT local variables — they must be set on the client's cipher object
-            // for the AARQ/AARE handshake and secured GET/SET/ACTION to work
-            if (this.settings != null) {
+            // Wire keys into Gurux's ciphering engine via getCiphering() (NOT settings.getCipher(),
+            // which is always null on this class hierarchy - see class-level note above)
+            GXCiphering ciphering = this.getCiphering();
+            if (ciphering != null) {
                 try {
-                    this.settings.getCipher().setBlockCipherKey(cipherKey);
-                    this.settings.getCipher().setAuthenticationKey(authKey);
-                    this.settings.getCipher().setSystemTitle(sysTitle);
+                    // Without this, Gurux defaults to Security.NONE and sends the
+                    // application context name for an UNCIPHERED connection - meters
+                    // that require the ciphered LN context reject the AARQ outright
+                    // ("Connection is permanently rejected... Meter expects Logical
+                    // Name referencing with secured connection"), before any keys are
+                    // even checked. HLSE is GMAC-based, i.e. inherently authenticated
+                    // + encrypted (AES-GCM) - the same security level configureHLSWithEncryption()
+                    // already sets, just via a different Authentication mode.
+                    ciphering.setSecurity(Security.AUTHENTICATION_ENCRYPTION);
+                    ciphering.setBlockCipherKey(cipherKey);
+                    ciphering.setAuthenticationKey(authKey);
+                    ciphering.setSystemTitle(sysTitle);
                     log.debug("HLSE keys wired to Gurux cipher: EK({}B) AK({}B) systemTitle({}B)",
                             cipherKey.length, authKey.length, sysTitle.length);
                 } catch (Exception e) {
@@ -128,7 +143,7 @@ public class GXDLMSSecureClient2 extends GXDLMSClient {
                     throw new Exception("Failed to set cipher keys: " + e.getMessage(), e);
                 }
             } else {
-                throw new IllegalStateException("GXDLMSSettings not initialized");
+                throw new IllegalStateException("GXCiphering not initialized");
             }
 
             log.debug("HLSE authentication configured with GMAC mode");
@@ -136,6 +151,93 @@ public class GXDLMSSecureClient2 extends GXDLMSClient {
             log.error("Failed to configure HLSE: {}", e.getMessage(), e);
             throw new Exception("HLSE configuration failed: " + e.getMessage(), e);
         }
+    }
+
+    /**
+     * Configure HLS-with-encryption authentication: a password-based challenge
+     * (Authentication.HIGH) combined with AES key based encryption+signing of the
+     * actual GET/SET/ACTION payloads (Security.AUTHENTICATION_ENCRYPTION).
+     *
+     * This is a DIFFERENT mechanism from HLSE/GMAC (configureHLSE) - do not confuse
+     * the two. A meter provisioned for one will reject the other. Some meters (seen
+     * in the field) require this combined password+key mode rather than pure HLSE.
+     *
+     * Requires:
+     * - password (for the HIGH authentication challenge)
+     * - blockCipherKey (AES-128 key for encryption, 16 bytes)
+     * - authenticationKey (HMAC key for authentication, 16 bytes)
+     * - systemTitle (sender identification, 8 bytes hex encoded)
+     *
+     * @param password Authentication password
+     * @param blockCipherKey AES-128 encryption key as hex string (16 bytes)
+     * @param authenticationKey HMAC authentication key as hex string (16 bytes)
+     * @param systemTitle Sender system title as hex string (8 bytes)
+     * @throws Exception if configuration fails
+     */
+    public void configureHLSWithEncryption(String password, String blockCipherKey, String authenticationKey,
+            String systemTitle) throws Exception {
+        try {
+            if (password == null || password.isEmpty()) {
+                throw new IllegalArgumentException("Password required for HLS-with-encryption authentication");
+            }
+            if (blockCipherKey == null || blockCipherKey.isEmpty()) {
+                throw new IllegalArgumentException("Block Cipher Key required for HLS-with-encryption authentication");
+            }
+            if (authenticationKey == null || authenticationKey.isEmpty()) {
+                throw new IllegalArgumentException("Authentication Key required for HLS-with-encryption authentication");
+            }
+            if (systemTitle == null || systemTitle.isEmpty()) {
+                throw new IllegalArgumentException("System Title required for HLS-with-encryption authentication");
+            }
+
+            byte[] cipherKey = hexStringToByteArray(blockCipherKey);
+            byte[] authKey = hexStringToByteArray(authenticationKey);
+            byte[] sysTitle = hexStringToByteArray(systemTitle);
+
+            if (cipherKey.length != 16) {
+                throw new IllegalArgumentException("Block Cipher Key must be 16 bytes, got: " + cipherKey.length);
+            }
+            if (authKey.length != 16) {
+                throw new IllegalArgumentException("Authentication Key must be 16 bytes, got: " + authKey.length);
+            }
+            if (sysTitle.length != 8) {
+                throw new IllegalArgumentException("System Title must be 8 bytes, got: " + sysTitle.length);
+            }
+
+            this.setAuthentication(Authentication.HIGH);
+            this.setPassword(password.getBytes("UTF-8"));
+
+            GXCiphering ciphering = this.getCiphering();
+            if (ciphering != null) {
+                try {
+                    ciphering.setSecurity(Security.AUTHENTICATION_ENCRYPTION);
+                    ciphering.setAuthenticationKey(authKey);
+                    ciphering.setBlockCipherKey(cipherKey);
+                    ciphering.setSystemTitle(sysTitle);
+                    log.debug("HLS+encryption keys wired to Gurux cipher: EK({}B) AK({}B) systemTitle({}B)",
+                            cipherKey.length, authKey.length, sysTitle.length);
+                } catch (Exception e) {
+                    log.warn("Failed to wire HLS+encryption keys to Gurux cipher: {}", e.getMessage());
+                    throw new Exception("Failed to set cipher keys: " + e.getMessage(), e);
+                }
+            } else {
+                throw new IllegalStateException("GXCiphering not initialized");
+            }
+
+            log.debug("HLS+encryption authentication configured (Authentication.HIGH + AUTHENTICATION_ENCRYPTION)");
+        } catch (Exception e) {
+            log.error("Failed to configure HLS+encryption: {}", e.getMessage(), e);
+            throw new Exception("HLS+encryption configuration failed: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Package-private accessor to the wired Gurux cipher, for test verification
+     * that configureHLSE() actually wired the keys (not just validated them).
+     * @return the Gurux cipher (GXCiphering, never null on this class)
+     */
+    GXICipher getCipher() {
+        return this.getCiphering();
     }
 
     /**

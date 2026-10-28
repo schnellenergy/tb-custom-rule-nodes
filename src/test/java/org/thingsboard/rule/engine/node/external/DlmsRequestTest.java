@@ -43,7 +43,6 @@ public class DlmsRequestTest {
         request.setBlockCipherKey("D0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE");
         request.setAuthenticationKey("000102030405060708090A0B0C0D0E0F");
         request.setSystemTitle("48455300000001");
-        request.setCounter("1001");
         request.setTimeout(30);
 
         assertEquals("Host should match", "192.168.1.100", request.getHost());
@@ -55,7 +54,6 @@ public class DlmsRequestTest {
         assertEquals("BlockCipherKey should match", "D0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE", request.getBlockCipherKey());
         assertEquals("AuthenticationKey should match", "000102030405060708090A0B0C0D0E0F", request.getAuthenticationKey());
         assertEquals("SystemTitle should match", "48455300000001", request.getSystemTitle());
-        assertEquals("Counter should match", "1001", request.getCounter());
         assertEquals("Timeout should match", 30, request.getTimeout());
     }
 
@@ -85,7 +83,6 @@ public class DlmsRequestTest {
         request.setBlockCipherKey("D0D1D2D3D4D5D6D7D8D9DADBDCDDDEDFE");
         request.setAuthenticationKey("000102030405060708090A0B0C0D0E0F");
         request.setSystemTitle("48455300000001");
-        request.setCounter("1");
 
         assertEquals("Host", "192.168.1.1", request.getHost());
         assertEquals("Port", 4059, request.getPort());

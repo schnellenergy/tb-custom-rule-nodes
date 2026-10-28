@@ -72,6 +72,39 @@ public class TbSendToTcpNodeConfiguration implements NodeConfiguration<TbSendToT
     private int fragmentTimeoutMs;
 
     /**
+     * Maximum time (ms) a socket may sit idle in the pool before being evicted.
+     * Defaults to 120 000 ms (2 min) to stay below the SEMC device-side
+     * teardown window. Set to 0 to disable idle eviction.
+     */
+    private int maxIdleMs = 120_000;
+
+    /**
+     * Templatized metadata key used to read the command correlation identifier.
+     * The value is included in both success and failure outbound message metadata
+     * under the key {@code cmdId}.
+     * Default: {@code "${cmdId}"}.
+     */
+    private String cmdIdKey = "${cmdId}";
+
+    /**
+     * Templatized metadata key used to read the overall RPC budget in
+     * milliseconds. When present, {@code connectTimeout} and {@code readTimeout}
+     * are derived from this value (20 % / 75 % split) instead of their static
+     * configured values. This enforces the nesting constraint:
+     * {@code connectTimeout + readTimeout < rpcTimeoutMs}.
+     * Default: {@code "${rpcTimeoutMs}"}.
+     */
+    private String rpcTimeoutKey = "${rpcTimeoutMs}";
+
+    /**
+     * Consecutive CONNECT-phase failures (to the same host:port) required before this
+     * node flags a message with alarm_action=RAISE. Cleared (alarm_action=CLEAR) on the
+     * next fully successful request. Default matches the "N configurable, default 3"
+     * requirement from the SEMC connection-refused ticket (#4433).
+     */
+    private int alarmThreshold = 3;
+
+    /**
      * TLS configuration (PEM or Keystore/Truststore, SNI, ALPN, etc).
      */
     private TlsConfig tlsConfig = new TlsConfig();
@@ -133,6 +166,10 @@ public class TbSendToTcpNodeConfiguration implements NodeConfiguration<TbSendToT
         config.setInitialBytesToStrip(0);
         config.setLengthByteOrder("BIG_ENDIAN");
         config.setFragmentTimeoutMs(50);
+        config.setMaxIdleMs(120_000);
+        config.setCmdIdKey("${cmdId}");
+        config.setRpcTimeoutKey("${rpcTimeoutMs}");
+        config.setAlarmThreshold(3);
         return config;
     }
 }

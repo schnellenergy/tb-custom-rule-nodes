@@ -78,7 +78,7 @@ public class TbSendToTcpNodeTest {
                 when(mockClient.sendRequest(org.mockito.ArgumentMatchers.anyString(),
                         org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
                         .thenReturn("{\"response\":\"string\"}");
-            } catch (java.io.IOException ignored) {
+            } catch (Exception ignored) {
             }
             TbSendToTcpNode.clientFactory = (h, p, t, ssl, ct, rt, ka) -> mockClient;
 
@@ -127,7 +127,7 @@ public class TbSendToTcpNodeTest {
                 when(mockClient.sendRequest(org.mockito.ArgumentMatchers.anyString(),
                         org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
                         .thenReturn("{\"response\":{\"key\":\"value\"}}");
-            } catch (java.io.IOException ignored) {
+            } catch (Exception ignored) {
             }
             TbSendToTcpNode.clientFactory = (h, p, t, ssl, ct, rt, ka) -> mockClient;
 
@@ -178,7 +178,7 @@ public class TbSendToTcpNodeTest {
                 when(mockClient.sendRequest(org.mockito.ArgumentMatchers.anyString(),
                         org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
                         .thenReturn("{\"response\":\"eqcADcABwQAHAQBeWwD/AgA=\"}");
-            } catch (java.io.IOException ignored) {
+            } catch (Exception ignored) {
             }
             TbSendToTcpNode.clientFactory = (h, p, t, ssl, ct, rt, ka) -> mockClient;
 
@@ -234,7 +234,7 @@ public class TbSendToTcpNodeTest {
                 when(mockClient.sendRequest(org.mockito.ArgumentMatchers.anyString(),
                         org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
                         .thenReturn("{\"response\":\"test over tls\"}");
-            } catch (java.io.IOException ignored) {
+            } catch (Exception ignored) {
             }
             TbSendToTcpNode.clientFactory = (h, p, t, ssl, ct, rt, ka) -> mockClient;
             TbMsgMetaData localMeta = new TbMsgMetaData();
@@ -719,5 +719,375 @@ public class TbSendToTcpNodeTest {
         // Null/empty defaults to newline
         byte[] def = TbTcpClient.resolveDelimiterBytes(null);
         org.junit.jupiter.api.Assertions.assertArrayEquals(new byte[]{'\n'}, def);
+    }
+
+    // ── New tests for issues #4433 / #4434 / #4435 ──────────────────────────
+
+    /**
+     * #4433 — Connection refused must produce tcpErrorPhase=CONNECT in failure msg metadata.
+     */
+    @Test
+    public void testConnectionRefused_structuredFailure() {
+        TbSendToTcpNode.ClientFactory originalFactory = TbSendToTcpNode.clientFactory;
+        try {
+            TbSendToTcpNode.clientFactory = (h, p, t, ssl, ct, rt, ka) -> {
+                TbTcpClient mockClient = mock(TbTcpClient.class);
+                try {
+                    org.mockito.Mockito.doThrow(new TbTcpException("CONNECT", "ConnectException",
+                            "Connection refused to " + h + ":" + p, h + ":" + p, null,
+                            new java.net.ConnectException("Connection refused")))
+                            .when(mockClient).connect(ct, rt);
+                    when(mockClient.isValid()).thenReturn(false);
+                } catch (Exception ignored) {}
+                return mockClient;
+            };
+
+            TbMsgMetaData localMeta = new TbMsgMetaData();
+            localMeta.putValue("tcpHost", "10.0.0.1");
+            localMeta.putValue("tcpPort", "4059");
+
+            TbSendToTcpNodeConfiguration config = new TbSendToTcpNodeConfiguration();
+            config.setHostKey("${tcpHost}");
+            config.setPortKey("${tcpPort}");
+            config.setTls(false);
+            config.setPayloadType("TEXT");
+            config.setResponseType("TEXT");
+            ObjectMapper mapper = new ObjectMapper();
+            JsonNode json = mapper.valueToTree(config);
+            TbSendToTcpNode testNode = new TbSendToTcpNode();
+            try {
+                testNode.init(ctx, new org.thingsboard.rule.engine.api.TbNodeConfiguration(json));
+            } catch (TbNodeException e) {
+                org.junit.jupiter.api.Assertions.fail("init failed: " + e.getMessage());
+            }
+            msg = TbMsg.newMsg().data("{\"payload\":\"cmd\"}")
+                    .metaData(localMeta).originator(new DeviceId(UUID.randomUUID())).build();
+            testNode.onMsg(ctx, msg);
+
+            verify(ctx).tellFailure(
+                    org.mockito.ArgumentMatchers.argThat(m -> {
+                        String phase = m.getMetaData().getValue("tcpErrorPhase");
+                        String detail = m.getMetaData().getValue("tcpErrorDetail");
+                        return "CONNECT".equals(phase) && detail != null && detail.contains("10.0.0.1");
+                    }),
+                    any(TbTcpException.class));
+            testNode.destroy();
+        } finally {
+            TbSendToTcpNode.clientFactory = originalFactory;
+        }
+    }
+
+    /**
+     * #4434 — A second concurrent borrow for the same host:port must throw BUSY.
+     */
+    @Test
+    public void testConnectionPool_busyRejection() throws Exception {
+        TbTcpConnectionPool testPool = new TbTcpConnectionPool(1, false, 120_000);
+        TbSendToTcpNode.ClientFactory originalFactory = TbSendToTcpNode.clientFactory;
+        try {
+            TbSendToTcpNode.clientFactory = (h, p, t, ssl, ct, rt, ka) -> {
+                TbTcpClient mc = mock(TbTcpClient.class);
+                when(mc.isValid()).thenReturn(true);
+                return mc;
+            };
+
+            // First borrow succeeds
+            TbTcpClient first = testPool.borrowClient("10.0.0.2", 4059, false, null, 500, 2000, "cmd-1");
+            org.junit.jupiter.api.Assertions.assertNotNull(first);
+
+            // Second borrow for same target must throw BUSY
+            try {
+                testPool.borrowClient("10.0.0.2", 4059, false, null, 500, 2000, "cmd-2");
+                org.junit.jupiter.api.Assertions.fail("Expected TbTcpException(BUSY)");
+            } catch (TbTcpException te) {
+                org.junit.jupiter.api.Assertions.assertEquals("POOL", te.getPhase());
+                org.junit.jupiter.api.Assertions.assertEquals("BUSY", te.getErrorClass());
+            }
+
+            // Different target must proceed normally
+            TbTcpClient other = testPool.borrowClient("10.0.0.3", 4059, false, null, 500, 2000, "cmd-3");
+            org.junit.jupiter.api.Assertions.assertNotNull(other);
+
+            testPool.returnClient(first, "10.0.0.2", 4059);
+            testPool.returnClient(other, "10.0.0.3", 4059);
+        } finally {
+            TbSendToTcpNode.clientFactory = originalFactory;
+            testPool.closeAll();
+        }
+    }
+
+    /**
+     * #4435 — Read timeout must NOT trigger a reconnect-and-retry.
+     * Exactly one TCP connection must be made; failure metadata must carry phase=READ.
+     */
+    @Test
+    public void testReadTimeout_noRetry() throws Exception {
+        java.util.concurrent.atomic.AtomicInteger connectionCount = new java.util.concurrent.atomic.AtomicInteger(0);
+        java.net.ServerSocket server = new java.net.ServerSocket(0);
+        int serverPort = server.getLocalPort();
+        Thread serverThread = new Thread(() -> {
+            try {
+                java.net.Socket client = server.accept();
+                connectionCount.incrementAndGet();
+                client.getInputStream().read(new byte[1024]);
+                Thread.sleep(60_000); // hold; never respond
+            } catch (Exception ignored) {}
+        });
+        serverThread.setDaemon(true);
+        serverThread.start();
+
+        TbSendToTcpNode.ClientFactory originalFactory = TbSendToTcpNode.clientFactory;
+        try {
+            TbSendToTcpNode.clientFactory = (h, p, t, ssl, ct, rt, ka) ->
+                    new TbTcpClient(h, p, t, ssl, ct, rt, ka);
+
+            TbMsgMetaData localMeta = new TbMsgMetaData();
+            localMeta.putValue("tcpHost", "127.0.0.1");
+            localMeta.putValue("tcpPort", String.valueOf(serverPort));
+            localMeta.putValue("rpcTimeoutMs", "400"); // read budget ~ 300 ms
+
+            TbSendToTcpNodeConfiguration config = new TbSendToTcpNodeConfiguration();
+            config.setHostKey("${tcpHost}");
+            config.setPortKey("${tcpPort}");
+            config.setTls(false);
+            config.setPayloadType("TEXT");
+            config.setResponseType("TEXT");
+            config.setFramingType("NONE");
+            config.setFragmentTimeoutMs(50);
+            config.setKeepAlive(false);
+            ObjectMapper mapper = new ObjectMapper();
+            JsonNode json = mapper.valueToTree(config);
+            TbSendToTcpNode testNode = new TbSendToTcpNode();
+            testNode.init(ctx, new org.thingsboard.rule.engine.api.TbNodeConfiguration(json));
+
+            msg = TbMsg.newMsg().data("{\"payload\":\"cmd\"}")
+                    .metaData(localMeta).originator(new DeviceId(UUID.randomUUID())).build();
+            testNode.onMsg(ctx, msg);
+
+            verify(ctx).tellFailure(
+                    org.mockito.ArgumentMatchers.argThat(m ->
+                            "READ".equals(m.getMetaData().getValue("tcpErrorPhase"))),
+                    any(Exception.class));
+            org.junit.jupiter.api.Assertions.assertEquals(1, connectionCount.get(),
+                    "Read timeout must not trigger a reconnect-and-retry");
+            testNode.destroy();
+        } finally {
+            TbSendToTcpNode.clientFactory = originalFactory;
+            server.close();
+        }
+    }
+
+    /**
+     * #4435 — cmdId from metadata must appear in the failure message metadata.
+     */
+    @Test
+    public void testCmdIdPropagatedInFailureMetadata() {
+        TbSendToTcpNode.ClientFactory originalFactory = TbSendToTcpNode.clientFactory;
+        try {
+            String expectedCmdId = "cmd-abc-123";
+            TbSendToTcpNode.clientFactory = (h, p, t, ssl, ct, rt, ka) -> {
+                TbTcpClient mc = mock(TbTcpClient.class);
+                try {
+                    org.mockito.Mockito.doThrow(new TbTcpException("CONNECT", "ConnectException",
+                            "Connection refused", h + ":" + p, expectedCmdId,
+                            new java.net.ConnectException("refused")))
+                            .when(mc).connect(ct, rt);
+                    when(mc.isValid()).thenReturn(false);
+                } catch (Exception ignored) {}
+                return mc;
+            };
+
+            TbMsgMetaData localMeta = new TbMsgMetaData();
+            localMeta.putValue("tcpHost", "10.0.0.1");
+            localMeta.putValue("tcpPort", "4059");
+            localMeta.putValue("cmdId", expectedCmdId);
+
+            TbSendToTcpNodeConfiguration config = new TbSendToTcpNodeConfiguration();
+            config.setHostKey("${tcpHost}");
+            config.setPortKey("${tcpPort}");
+            config.setTls(false);
+            config.setPayloadType("TEXT");
+            config.setResponseType("TEXT");
+            ObjectMapper mapper = new ObjectMapper();
+            JsonNode json = mapper.valueToTree(config);
+            TbSendToTcpNode testNode = new TbSendToTcpNode();
+            try {
+                testNode.init(ctx, new org.thingsboard.rule.engine.api.TbNodeConfiguration(json));
+            } catch (TbNodeException e) {
+                org.junit.jupiter.api.Assertions.fail("init failed: " + e.getMessage());
+            }
+            msg = TbMsg.newMsg().data("{\"payload\":\"cmd\"}")
+                    .metaData(localMeta).originator(new DeviceId(UUID.randomUUID())).build();
+            testNode.onMsg(ctx, msg);
+
+            verify(ctx).tellFailure(
+                    org.mockito.ArgumentMatchers.argThat(m ->
+                            expectedCmdId.equals(m.getMetaData().getValue("cmdId"))),
+                    any(Exception.class));
+            testNode.destroy();
+        } finally {
+            TbSendToTcpNode.clientFactory = originalFactory;
+        }
+    }
+
+    /**
+     * #4435 — rpcTimeoutMs=10000 must derive connectMs=2000 and readMs=7500.
+     */
+    @Test
+    public void testRpcTimeoutDrivesConnectAndReadTimeouts() throws Exception {
+        TbSendToTcpNode.ClientFactory originalFactory = TbSendToTcpNode.clientFactory;
+        try {
+            java.util.concurrent.atomic.AtomicInteger capturedConnect = new java.util.concurrent.atomic.AtomicInteger(-1);
+            java.util.concurrent.atomic.AtomicInteger capturedRead = new java.util.concurrent.atomic.AtomicInteger(-1);
+
+            TbSendToTcpNode.clientFactory = (h, p, t, ssl, ct, rt, ka) -> {
+                capturedConnect.set(ct);
+                capturedRead.set(rt);
+                TbTcpClient mc = mock(TbTcpClient.class);
+                try {
+                    when(mc.isValid()).thenReturn(true);
+                    when(mc.sendRequest(
+                            org.mockito.ArgumentMatchers.anyString(),
+                            org.mockito.ArgumentMatchers.any(),
+                            org.mockito.ArgumentMatchers.any()))
+                            .thenReturn("{\"response\":\"ok\"}");
+                    when(mc.sendRequest(
+                            org.mockito.ArgumentMatchers.anyString(),
+                            org.mockito.ArgumentMatchers.any(),
+                            org.mockito.ArgumentMatchers.any(),
+                            org.mockito.ArgumentMatchers.anyInt(),
+                            org.mockito.ArgumentMatchers.anyInt(),
+                            org.mockito.ArgumentMatchers.any()))
+                            .thenReturn("{\"response\":\"ok\"}");
+                    when(mc.getLastPhaseTimings()).thenReturn(new long[]{10L, 5L, 50L});
+                } catch (Exception ignored) {}
+                return mc;
+            };
+
+            TbMsgMetaData localMeta = new TbMsgMetaData();
+            localMeta.putValue("tcpHost", "10.0.0.1");
+            localMeta.putValue("tcpPort", "4059");
+            localMeta.putValue("rpcTimeoutMs", "10000");
+
+            TbSendToTcpNodeConfiguration config = new TbSendToTcpNodeConfiguration();
+            config.setHostKey("${tcpHost}");
+            config.setPortKey("${tcpPort}");
+            config.setTls(false);
+            config.setPayloadType("TEXT");
+            config.setResponseType("TEXT");
+            config.setConnectTimeout(1000); // must be overridden
+            config.setReadTimeout(5000);    // must be overridden
+            ObjectMapper mapper = new ObjectMapper();
+            JsonNode json = mapper.valueToTree(config);
+            TbSendToTcpNode testNode = new TbSendToTcpNode();
+            testNode.init(ctx, new org.thingsboard.rule.engine.api.TbNodeConfiguration(json));
+
+            msg = TbMsg.newMsg().data("{\"payload\":\"cmd\"}")
+                    .metaData(localMeta).originator(new DeviceId(UUID.randomUUID())).build();
+            testNode.onMsg(ctx, msg);
+
+            org.junit.jupiter.api.Assertions.assertEquals(2000, capturedConnect.get(),
+                    "connectTimeout must be 20% of rpcTimeoutMs=10000");
+            org.junit.jupiter.api.Assertions.assertEquals(7500, capturedRead.get(),
+                    "readTimeout must be 75% of rpcTimeoutMs=10000");
+            testNode.destroy();
+        } finally {
+            TbSendToTcpNode.clientFactory = originalFactory;
+        }
+    }
+
+    /**
+     * #4434 — Idle sockets beyond maxIdleMs must be evicted; a new connection created.
+     */
+    @Test
+    public void testPoolEvictsIdleSocket() throws Exception {
+        TbTcpConnectionPool testPool = new TbTcpConnectionPool(10, false, 100);
+        TbSendToTcpNode.ClientFactory originalFactory = TbSendToTcpNode.clientFactory;
+        java.util.concurrent.atomic.AtomicInteger newConnections = new java.util.concurrent.atomic.AtomicInteger(0);
+        try {
+            TbSendToTcpNode.clientFactory = (h, p, t, ssl, ct, rt, ka) -> {
+                newConnections.incrementAndGet();
+                TbTcpClient mc = mock(TbTcpClient.class);
+                when(mc.isValid()).thenReturn(true);
+                return mc;
+            };
+
+            TbTcpClient first = testPool.borrowClient("10.0.0.5", 4059, false, null, 500, 2000, null);
+            testPool.returnClient(first, "10.0.0.5", 4059);
+
+            Thread.sleep(200); // exceed maxIdleMs=100
+
+            TbTcpClient second = testPool.borrowClient("10.0.0.5", 4059, false, null, 500, 2000, null);
+            org.junit.jupiter.api.Assertions.assertNotNull(second);
+            org.junit.jupiter.api.Assertions.assertEquals(2, newConnections.get(),
+                    "A new connection must be made after idle eviction");
+            testPool.returnClient(second, "10.0.0.5", 4059);
+        } finally {
+            TbSendToTcpNode.clientFactory = originalFactory;
+            testPool.closeAll();
+        }
+    }
+
+    /**
+     * #4435 — SocketTimeoutException on read → tcpErrorPhase=READ + cmdId in failure metadata.
+     */
+    @Test
+    public void testReadTimeout_metadataContainsReadPhase() throws Exception {
+        java.net.ServerSocket server = new java.net.ServerSocket(0);
+        int serverPort = server.getLocalPort();
+        Thread serverThread = new Thread(() -> {
+            try {
+                java.net.Socket client = server.accept();
+                client.getInputStream().read(new byte[1024]);
+                Thread.sleep(60_000);
+            } catch (Exception ignored) {}
+        });
+        serverThread.setDaemon(true);
+        serverThread.start();
+
+        TbSendToTcpNode.ClientFactory originalFactory = TbSendToTcpNode.clientFactory;
+        try {
+            TbSendToTcpNode.clientFactory = (h, p, t, ssl, ct, rt, ka) ->
+                    new TbTcpClient(h, p, t, ssl, ct, rt, ka);
+
+            TbMsgMetaData localMeta = new TbMsgMetaData();
+            localMeta.putValue("tcpHost", "127.0.0.1");
+            localMeta.putValue("tcpPort", String.valueOf(serverPort));
+            localMeta.putValue("rpcTimeoutMs", "400");
+            localMeta.putValue("cmdId", "test-cmd-999");
+
+            TbSendToTcpNodeConfiguration config = new TbSendToTcpNodeConfiguration();
+            config.setHostKey("${tcpHost}");
+            config.setPortKey("${tcpPort}");
+            config.setTls(false);
+            config.setPayloadType("TEXT");
+            config.setResponseType("TEXT");
+            config.setFramingType("NONE");
+            config.setFragmentTimeoutMs(50);
+            config.setKeepAlive(false);
+            ObjectMapper mapper = new ObjectMapper();
+            JsonNode json = mapper.valueToTree(config);
+            TbSendToTcpNode testNode = new TbSendToTcpNode();
+            testNode.init(ctx, new org.thingsboard.rule.engine.api.TbNodeConfiguration(json));
+
+            msg = TbMsg.newMsg().data("{\"payload\":\"cmd\"}")
+                    .metaData(localMeta).originator(new DeviceId(UUID.randomUUID())).build();
+            testNode.onMsg(ctx, msg);
+
+            verify(ctx).tellFailure(
+                    org.mockito.ArgumentMatchers.argThat(m -> {
+                        String phase  = m.getMetaData().getValue("tcpErrorPhase");
+                        String detail = m.getMetaData().getValue("tcpErrorDetail");
+                        String cmdId  = m.getMetaData().getValue("cmdId");
+                        return "READ".equals(phase)
+                                && detail != null && !detail.isEmpty()
+                                && "test-cmd-999".equals(cmdId);
+                    }),
+                    any(Exception.class));
+            testNode.destroy();
+        } finally {
+            TbSendToTcpNode.clientFactory = originalFactory;
+            server.close();
+        }
     }
 }

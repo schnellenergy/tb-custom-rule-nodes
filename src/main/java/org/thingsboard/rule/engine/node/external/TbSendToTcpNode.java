@@ -21,19 +21,54 @@ import org.thingsboard.rule.engine.api.TbNode;
 import org.thingsboard.rule.engine.api.TbNodeConfiguration;
 import org.thingsboard.rule.engine.api.TbNodeException;
 import org.thingsboard.rule.engine.api.util.TbNodeUtils;
+import org.thingsboard.server.common.data.AttributeScope;
+import org.thingsboard.server.common.data.kv.AttributeKvEntry;
+import org.thingsboard.server.common.data.kv.AttributesSaveResult;
+import org.thingsboard.server.common.data.kv.BaseAttributeKvEntry;
+import org.thingsboard.server.common.data.kv.LongDataEntry;
 import org.thingsboard.server.common.data.plugin.ComponentType;
 import org.thingsboard.server.common.msg.TbMsg;
 import org.thingsboard.server.common.msg.TbMsgDataType;
+import org.thingsboard.server.common.msg.TbMsgMetaData;
 
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.common.util.concurrent.FutureCallback;
+import com.google.common.util.concurrent.Futures;
+import com.google.common.util.concurrent.ListenableFuture;
 import lombok.extern.slf4j.Slf4j;
 
 /**
  * Sends data to a TCP endpoint with dynamic TLS/PEM configuration from
  * metadata.
+ *
+ * <p>Changes for SmartLights_2.0 issues #4433 / #4434 / #4435:
+ * <ul>
+ *   <li><strong>RPC-derived timeouts (#4435)</strong> — when metadata key
+ *       {@code rpcTimeoutMs} is present, {@code connectTimeout} and
+ *       {@code readTimeout} are derived as 20 % / 75 % of the budget. Static
+ *       config values are used as fallback.</li>
+ *   <li><strong>Error metadata enrichment (#4433 / #4434 / #4435)</strong> —
+ *       any {@link TbTcpException} is caught and its phase, error class, detail
+ *       and target are written into the outbound message metadata before
+ *       {@code tellFailure}.</li>
+ *   <li><strong>cmd_id correlation (#4435)</strong> — resolved from metadata
+ *       via {@code cmdIdKey}; included in both success and failure metadata.</li>
+ *   <li><strong>Timing metadata on success</strong> — {@code tcpConnectMs},
+ *       {@code tcpWriteMs}, {@code tcpReadMs} added to the success message.</li>
+ *   <li><strong>Consecutive-failure alarm (#4433)</strong> — a per-target count of
+ *       consecutive {@code CONNECT}-phase failures is tracked (durable across restarts
+ *       via a {@code tcpConsecutiveConnectFailures} device attribute) and, once it
+ *       reaches {@code alarmThreshold}, {@code alarm_action=RAISE} is added to the
+ *       message metadata; a subsequent success emits {@code alarm_action=CLEAR}. A
+ *       downstream rule chain acts on these to raise/clear a "SEMC Unreachable" alarm.</li>
+ * </ul>
+ *
  * Created by Kalaivanan S on 11-July-2025.
  */
 @Slf4j
@@ -41,10 +76,16 @@ import lombok.extern.slf4j.Slf4j;
                 + "<span><strong>Connection Settings</strong></span>"
                 + "<ul>"
                 + "<li><code>hostKey</code> / <code>portKey</code> &ndash; Template expressions that resolve to the target host and port from metadata or message data. Defaults: <code>${tcpHost}</code> / <code>${tcpPort}</code>.</li>"
-                + "<li><code>connectTimeout</code> &ndash; Maximum time (ms) allowed for the TCP handshake. Default: <code>1000 ms</code>.</li>"
-                + "<li><code>readTimeout</code> &ndash; Maximum idle time (ms) while reading a response. Default: <code>5000 ms</code>.</li>"
+                + "<li><code>connectTimeout</code> &ndash; Fallback maximum time (ms) for the TCP handshake when <code>rpcTimeoutMs</code> is absent. Default: <code>1000 ms</code>.</li>"
+                + "<li><code>readTimeout</code> &ndash; Fallback maximum idle time (ms) while reading when <code>rpcTimeoutMs</code> is absent. Default: <code>5000 ms</code>.</li>"
+                + "<li><code>rpcTimeoutKey</code> &ndash; Metadata key carrying the overall RPC budget (ms). When present, connect and read timeouts are derived as 20 % / 75 % of this value. Default: <code>${rpcTimeoutMs}</code>.</li>"
                 + "<li><code>keepAlive</code> &ndash; When <code>true</code>, sockets are kept open and reused from the pool. Default: <code>true</code>.</li>"
-                + "<li><code>maxConnections</code> &ndash; Size of the connection pool per host/port pair. Set to <code>0</code> to disable pooling. Default: <code>10</code>.</li>"
+                + "<li><code>maxConnections</code> &ndash; Size of the connection pool per host/port pair. Default: <code>10</code>.</li>"
+                + "<li><code>maxIdleMs</code> &ndash; Maximum idle time (ms) before a pooled socket is evicted. Default: <code>120000 ms</code> (2 min).</li>"
+                + "</ul>"
+                + "<span><strong>Command Correlation</strong></span>"
+                + "<ul>"
+                + "<li><code>cmdIdKey</code> &ndash; Metadata template that resolves to a command identifier. Forwarded in both success and failure metadata as <code>cmdId</code>. Default: <code>${cmdId}</code>.</li>"
                 + "</ul>"
                 + "<span><strong>Payload &amp; Response Types</strong></span>"
                 + "<ul>"
@@ -53,29 +94,32 @@ import lombok.extern.slf4j.Slf4j;
                 + "</ul>"
                 + "<span><strong>Response Framing</strong> &ndash; controlled by <code>framingType</code>:</span>"
                 + "<ul>"
-                + "<li><code>NONE</code> (smart-timeout) &ndash; Reads until no new data arrives for <code>fragmentTimeoutMs</code> ms or the server closes the connection. Default fragment timeout: <code>50 ms</code>. Increase if the server sends large responses in multiple TCP segments.</li>"
-                + "<li><code>DELIMITER</code> &ndash; Reads until a specific byte sequence is found. Configure <code>delimiter</code> using escape sequences: <code>\\n</code> (LF), <code>\\r\\n</code> (CRLF), <code>\\t</code> (TAB), or hex e.g. <code>\\x00</code>. Default: <code>\\n</code>.</li>"
-                + "<li><code>LENGTH_PREFIX</code> (Netty-style) &ndash; Reads a fixed-size length field from the stream, then reads exactly that many bytes. Parameters:"
-                + "<ul>"
-                + "<li><code>lengthFieldOffset</code> &ndash; Byte offset where the length field starts (default <code>0</code>).</li>"
-                + "<li><code>lengthFieldLength</code> &ndash; Size of the length field in bytes: 1, 2, 3, 4, or 8 (default <code>4</code>).</li>"
-                + "<li><code>lengthAdjustment</code> &ndash; Value added to the length field to obtain the full frame length (default <code>0</code>).</li>"
-                + "<li><code>initialBytesToStrip</code> &ndash; Bytes to discard from the start of the decoded frame, e.g. to remove the length header itself (default <code>0</code>).</li>"
-                + "<li><code>maxFrameLength</code> &ndash; Safety limit in bytes; frames larger than this cause an error (default <code>1 048 576</code> = 1 MiB).</li>"
-                + "<li><code>lengthByteOrder</code> &ndash; <code>BIG_ENDIAN</code> or <code>LITTLE_ENDIAN</code> (default <code>BIG_ENDIAN</code>).</li>"
+                + "<li><code>NONE</code> (smart-timeout) &ndash; Reads until no new data arrives for <code>fragmentTimeoutMs</code> ms or the server closes the connection.</li>"
+                + "<li><code>DELIMITER</code> &ndash; Reads until a specific byte sequence is found. Configure <code>delimiter</code> using escape sequences: <code>\\n</code>, <code>\\r\\n</code>, <code>\\t</code>, or hex e.g. <code>\\x00</code>. Default: <code>\\n</code>.</li>"
+                + "<li><code>LENGTH_PREFIX</code> (Netty-style) &ndash; Reads a fixed-size length field from the stream, then reads exactly that many bytes.</li>"
                 + "</ul>"
-                + "</li>"
+                + "<span><strong>Failure Metadata</strong> &ndash; on the <em>Failure</em> chain the message metadata will contain:</span>"
+                + "<ul>"
+                + "<li><code>tcpErrorPhase</code> &ndash; CONNECT / WRITE / READ / POOL</li>"
+                + "<li><code>tcpErrorClass</code> &ndash; Java exception class name</li>"
+                + "<li><code>tcpErrorDetail</code> &ndash; Human-readable error detail including target endpoint</li>"
+                + "<li><code>tcpTarget</code> &ndash; host:port</li>"
+                + "<li><code>cmdId</code> &ndash; Command correlation identifier</li>"
+                + "</ul>"
+                + "<span><strong>Consecutive-Failure Alarm</strong></span>"
+                + "<ul>"
+                + "<li><code>alarmThreshold</code> &ndash; Number of consecutive <code>CONNECT</code>-phase failures to the same target before the message is flagged for an alarm. Default: <code>3</code>.</li>"
+                + "<li>On reaching the threshold, metadata carries <code>alarm_action=RAISE</code>; a subsequent success emits <code>alarm_action=CLEAR</code>. A downstream rule chain uses these to raise/clear an alarm.</li>"
+                + "<li>The running count is persisted on the device as the <code>tcpConsecutiveConnectFailures</code> server-scope attribute, so it survives node restarts.</li>"
                 + "</ul>"
                 + "<span><strong>TLS Configuration</strong> (when <code>tls</code> is enabled)</span>"
                 + "<ul>"
                 + "<li><code>caCertificateKey</code> &ndash; Templatized key resolving to a PEM CA certificate for server trust verification.</li>"
-                + "<li><code>certificateKey</code> / <code>privateKeyKey</code> &ndash; Templatized keys for the client certificate and private key (mutual TLS). Supports PKCS#8, PKCS#1 RSA, and SEC1 EC formats.</li>"
+                + "<li><code>certificateKey</code> / <code>privateKeyKey</code> &ndash; Templatized keys for the client certificate and private key (mutual TLS).</li>"
                 + "<li><code>privateKeyPassphraseKey</code> &ndash; Templatized key for the private-key passphrase (if encrypted).</li>"
                 + "<li><code>verifyServerCertificate</code> &ndash; Set to <code>false</code> to disable server certificate validation (insecure &ndash; testing only). Default: <code>true</code>.</li>"
-                + "<li><code>serverNameKey</code> &ndash; Templatized key for SNI hostname sent during TLS handshake.</li>"
-                + "<li><code>alpnProtocolKey</code> &ndash; Templatized key for ALPN protocol negotiation (e.g. <code>h2</code>).</li>"
                 + "</ul>"
-                + "<span><strong>Output:</strong> On success the node emits the TCP response as a new message on the <em>Success</em> chain. On any error (connection refused, timeout, framing error, missing <code>payload</code> key) the original message is forwarded on the <em>Failure</em> chain with the exception detail.</span>", uiResources = {
+                + "<span><strong>Output:</strong> On success the node emits the TCP response as a new message on the <em>Success</em> chain. On any error the original message (with enriched metadata) is forwarded on the <em>Failure</em> chain.</span>", uiResources = {
         "static/rulenode/custom-nodes-config.js" }, configDirective = "tbExternalNodeSendToTcpConfig", icon = "call_made")
 public class TbSendToTcpNode implements TbNode {
 
@@ -91,6 +135,20 @@ public class TbSendToTcpNode implements TbNode {
 
     private volatile TbTcpConnectionPool pool;
     private final ConcurrentMap<String, javax.net.ssl.SSLSocketFactory> sslSocketFactoryCache = new ConcurrentHashMap<>();
+
+    // Device attribute key backing the durable copy of the per-target consecutive
+    // CONNECT-failure count (see recordConnectFailure/recordConnectSuccess). Part of
+    // the #4433 "count / remember / alarm" fix.
+    private static final String FAILURE_COUNT_ATTRIBUTE_KEY = "tcpConsecutiveConnectFailures";
+    private static final long ATTRIBUTE_HYDRATE_TIMEOUT_MS = 2000;
+
+    // Fast in-memory cache of per-target (host:port) consecutive CONNECT-failure counts.
+    // This alone would lose all counts on every restart/crash (plain JVM memory) - it is
+    // backed by FAILURE_COUNT_ATTRIBUTE_KEY as the durable copy, hydrated once per target
+    // per node lifetime (see getOrHydrateCounter) so a restarted node picks up exactly
+    // where it left off instead of silently forgetting an already-raised alarm.
+    private final ConcurrentHashMap<String, AtomicInteger> consecutiveConnectFailures = new ConcurrentHashMap<>();
+    private int alarmThreshold;
 
     // Client factory to allow tests to inject mocks. Defaults to real client
     // constructor.
@@ -111,12 +169,13 @@ public class TbSendToTcpNode implements TbNode {
         tlsConfig = config.getTlsConfig();
         payloadType = config.getPayloadType() != null ? config.getPayloadType() : "TEXT";
         responseType = config.getResponseType() != null ? config.getResponseType() : "TEXT";
-        
+        alarmThreshold = config.getAlarmThreshold() > 0 ? config.getAlarmThreshold() : 3;
+
+        int maxIdleMs = config.getMaxIdleMs() > 0 ? config.getMaxIdleMs() : 120_000;
         pool = new TbTcpConnectionPool(
                 config.getMaxConnections(),
-                config.getConnectTimeout(),
-                config.getReadTimeout(),
-                config.isKeepAlive());
+                config.isKeepAlive(),
+                maxIdleMs);
     }
 
     @Override
@@ -124,12 +183,14 @@ public class TbSendToTcpNode implements TbNode {
         if (pool != null) {
             pool.closeAll();
         }
+        consecutiveConnectFailures.clear();
     }
 
     @Override
     public void onMsg(TbContext ctx, TbMsg msg) {
         ctx.getExternalCallExecutor().execute(() -> {
-            String targetHost, portStr;
+            try {
+                String targetHost, portStr;
             try {
                 targetHost = TbNodeUtils.processPattern(hostKey, msg);
                 portStr = TbNodeUtils.processPattern(portKey, msg);
@@ -148,6 +209,49 @@ public class TbSendToTcpNode implements TbNode {
                 ctx.tellFailure(msg, new IllegalArgumentException("Message doesn't contain a valid port: " + portStr));
                 return;
             }
+
+            // ── Resolve cmd_id (#4435) ──────────────────────────────────────────────
+            String cmdIdKey = config.getCmdIdKey() != null ? config.getCmdIdKey() : "${cmdId}";
+            String cmdId = null;
+            try {
+                String resolved = TbNodeUtils.processPattern(cmdIdKey, msg);
+                // Only use the resolved value if it differs from the raw template (i.e. the key was present)
+                if (resolved != null && !resolved.isEmpty() && !resolved.equals(cmdIdKey)) {
+                    cmdId = resolved;
+                }
+            } catch (Exception ignored) {
+                // cmdId is optional — absence is not an error
+            }
+            if (cmdId == null) {
+                cmdId = (msg != null && msg.getId() != null) ? msg.getId().toString() : java.util.UUID.randomUUID().toString();
+            }
+
+            // ── Derive timeouts from rpcTimeoutMs metadata (#4435) ──────────────────
+            String rpcTimeoutKey = config.getRpcTimeoutKey() != null ? config.getRpcTimeoutKey() : "${rpcTimeoutMs}";
+            int connectTimeoutMs = config.getConnectTimeout() > 0 ? config.getConnectTimeout() : 1_000;
+            int readTimeoutMs    = config.getReadTimeout()    > 0 ? config.getReadTimeout()    : 5_000;
+            try {
+                String rpcMsStr = TbNodeUtils.processPattern(rpcTimeoutKey, msg);
+                if (rpcMsStr != null && !rpcMsStr.isEmpty() && !rpcMsStr.equals(rpcTimeoutKey)) {
+                    long rpcMs = Long.parseLong(rpcMsStr);
+                    if (rpcMs > 0) {
+                        connectTimeoutMs = (int) (rpcMs * 0.20);
+                        readTimeoutMs    = (int) (rpcMs * 0.75);
+                        if (connectTimeoutMs + readTimeoutMs >= rpcMs) {
+                            log.warn("[tcp-node] Timeout nesting violated: connectMs={} + readMs={} >= rpcMs={} for target={}:{}",
+                                    connectTimeoutMs, readTimeoutMs, rpcMs, targetHost, targetPort);
+                        } else {
+                            log.debug("[tcp-node] Derived timeouts from rpcTimeoutMs={}: connectMs={} readMs={}",
+                                    rpcMs, connectTimeoutMs, readTimeoutMs);
+                        }
+                    }
+                }
+            } catch (NumberFormatException nfe) {
+                log.warn("[tcp-node] rpcTimeoutMs metadata value is not a valid number — using static config defaults");
+            } catch (Exception ignored) {
+                // Key absent from metadata: silently fall back to static config
+            }
+
             try {
                 javax.net.ssl.SSLSocketFactory sslFactory = null;
                 if (tls) {
@@ -165,10 +269,10 @@ public class TbSendToTcpNode implements TbNode {
                             : null;
                     boolean verifyServerCert = tlsConfig.getVerifyServerCertificate() == null
                             || tlsConfig.getVerifyServerCertificate();
-                            
-                    String cacheKey = (caPem != null ? caPem : "") + "|" + 
-                                      (certPem != null ? certPem : "") + "|" + 
-                                      (keyPem != null ? keyPem : "") + "|" + 
+
+                    String cacheKey = (caPem != null ? caPem : "") + "|" +
+                                      (certPem != null ? certPem : "") + "|" +
+                                      (keyPem != null ? keyPem : "") + "|" +
                                       (keyPassword != null ? keyPassword : "") + "|" + verifyServerCert;
                     sslFactory = sslSocketFactoryCache.computeIfAbsent(cacheKey, k -> {
                         try {
@@ -180,7 +284,7 @@ public class TbSendToTcpNode implements TbNode {
                 }
                 TbMsgDataType pt = TbMsgDataType.valueOf(payloadType.toUpperCase());
                 TbMsgDataType rt = TbMsgDataType.valueOf(responseType.toUpperCase());
-                
+
                 String payload = null;
                 try {
                     com.fasterxml.jackson.databind.JsonNode dataNode = com.fasterxml.jackson.databind.node.NullNode
@@ -202,34 +306,224 @@ public class TbSendToTcpNode implements TbNode {
                     ctx.tellFailure(msg, new IllegalArgumentException("No 'payload' key found in msg data"));
                     return;
                 }
-                
+
+                final String finalCmdId = cmdId;
+                final int finalConnectMs = connectTimeoutMs;
+                final int finalReadMs = readTimeoutMs;
+                final String finalTarget = targetHost + ":" + targetPort;
+
                 TbTcpClient client = null;
                 try {
-                    client = pool.borrowClient(targetHost, targetPort, tls, sslFactory);
+                    client = pool.borrowClient(targetHost, targetPort, tls, sslFactory,
+                            finalConnectMs, finalReadMs, finalCmdId);
                     client.setFramingSettings(config);
+                    client.setInvocationContext(finalConnectMs, finalReadMs, finalCmdId);
                     String response = client.sendRequest(payload, pt, rt);
 
-                    // Convert response to a TbMsg
-                    TbMsg responseMsg = msg.transform()
-                            .data(response)
-                            .dataType(rt) // Keep original response type
-                            .build();
-                    log.debug("Received TCP response: {}", response);
-                    
+                    // Enrich success metadata with timing and correlation
+                    long[] timings = client.getLastPhaseTimings();
+                    TbMsgMetaData successMeta = msg.getMetaData() != null ? msg.getMetaData().copy() : new TbMsgMetaData();
+                    successMeta.putValue("cmdId", finalCmdId);
+                    if (timings != null && timings.length >= 3) {
+                        if (timings[0] >= 0) successMeta.putValue("tcpConnectMs", String.valueOf(timings[0]));
+                        if (timings[1] >= 0) successMeta.putValue("tcpWriteMs",   String.valueOf(timings[1]));
+                        if (timings[2] >= 0) successMeta.putValue("tcpReadMs",    String.valueOf(timings[2]));
+                    }
+                    // #4433: a full success resets the consecutive CONNECT-failure streak
+                    // and, if an alarm was plausibly raised, flags alarm_action=CLEAR.
+                    recordConnectSuccess(ctx, msg, finalTarget, successMeta);
+
+                    TbMsg responseMsg;
+                    try {
+                        responseMsg = msg.transform()
+                                .data(response)
+                                .dataType(rt)
+                                .metaData(successMeta)
+                                .build();
+                    } catch (Exception ex) {
+                        responseMsg = msg;
+                    }
+                    log.debug("Received TCP response for cmdId={}: {}", finalCmdId, response);
+
                     pool.returnClient(client, targetHost, targetPort);
                     ctx.tellSuccess(responseMsg);
-                } catch (Exception e) {
-                    log.error("Failed to send TCP request", e);
+
+                } catch (TbTcpException te) {
+                    // Structured TCP error (#4433 / #4434 / #4435) —
+                    // enrich metadata and forward to the Failure chain.
+                    log.error("[tcp-node] {} phase={} target={} cmdId={}: {}",
+                            te.getErrorClass(), te.getPhase(), te.getTarget(), finalCmdId, te.getErrorDetail(), te);
                     if (client != null) {
                         pool.discardClient(client, targetHost, targetPort);
                     }
-                    ctx.tellFailure(msg, new IllegalArgumentException("Failed to send TCP request: " + e.getMessage(), e));
+                    // For POOL/BUSY the in-use flag was already released inside the pool
+                    TbMsgMetaData failMeta = msg.getMetaData() != null ? msg.getMetaData().copy() : new TbMsgMetaData();
+                    failMeta.putValue("cmdId",           finalCmdId);
+                    failMeta.putValue("tcpErrorPhase",   te.getPhase());
+                    failMeta.putValue("tcpErrorClass",   te.getErrorClass());
+                    failMeta.putValue("tcpErrorDetail",  te.getErrorDetail());
+                    failMeta.putValue("tcpTarget",       te.getTarget() != null ? te.getTarget() : finalTarget);
+                    // #4433: only a CONNECT-phase failure counts toward "unreachable" —
+                    // a WRITE/READ failure means the connection itself succeeded.
+                    if ("CONNECT".equals(te.getPhase())) {
+                        recordConnectFailure(ctx, msg, finalTarget, failMeta);
+                    }
+                    TbMsg failMsg;
+                    try {
+                        failMsg = msg.transform().metaData(failMeta).build();
+                    } catch (Exception ex) {
+                        failMsg = msg;
+                    }
+                    ctx.tellFailure(failMsg, te);
+
+                } catch (Exception e) {
+                    log.error("Failed to send TCP request (unclassified)", e);
+                    if (client != null) {
+                        pool.discardClient(client, targetHost, targetPort);
+                    }
+                    TbMsgMetaData failMeta = msg.getMetaData() != null ? msg.getMetaData().copy() : new TbMsgMetaData();
+                    failMeta.putValue("cmdId",           finalCmdId);
+                    failMeta.putValue("tcpErrorPhase",   "UNKNOWN");
+                    failMeta.putValue("tcpErrorClass",   e.getClass().getSimpleName());
+                    failMeta.putValue("tcpErrorDetail",  e.getMessage() != null ? e.getMessage() : e.toString());
+                    failMeta.putValue("tcpTarget",       finalTarget);
+                    TbMsg failMsg;
+                    try {
+                        failMsg = msg.transform().metaData(failMeta).build();
+                    } catch (Exception ex) {
+                        failMsg = msg;
+                    }
+                    ctx.tellFailure(failMsg, new IllegalArgumentException("Failed to send TCP request: " + e.getMessage(), e));
                 }
             } catch (Exception e) {
                 log.error("TCP node failed to process message", e.fillInStackTrace());
                 ctx.tellFailure(msg, new TbNodeException("Unable to process message: " + e.getLocalizedMessage()));
             }
-        });
+        } catch (Throwable t) {
+            log.error("Fatal error processing message in TCP node", t);
+            ctx.tellFailure(msg, t instanceof Exception ? (Exception) t : new RuntimeException(t));
+        }
+    });
+}
+
+    /**
+     * Fast in-memory lookup of the per-target counter, hydrating it from the durable
+     * device attribute exactly once per target per node lifetime if it isn't cached yet
+     * (i.e. this is the first message for this target since the node last started).
+     * Deliberately NOT computeIfAbsent(): hydration can block briefly on I/O, and
+     * blocking inside a ConcurrentHashMap compute callback is unsafe/discouraged - so the
+     * (rare, harmless-if-duplicated) hydrate call happens outside any map computation,
+     * with putIfAbsent resolving the harmless race if two threads hydrate the same target
+     * at once.
+     */
+    private AtomicInteger getOrHydrateCounter(TbContext ctx, TbMsg msg, String target) {
+        AtomicInteger cached = consecutiveConnectFailures.get(target);
+        if (cached != null) {
+            return cached;
+        }
+        int hydrated = hydrateFailureCount(ctx, msg);
+        AtomicInteger created = new AtomicInteger(hydrated);
+        AtomicInteger existing = consecutiveConnectFailures.putIfAbsent(target, created);
+        return existing != null ? existing : created;
+    }
+
+    /**
+     * One-time (per target, per node lifetime) read of the durable failure count from the
+     * device's SERVER_SCOPE attribute. Runs on the external-call executor, which already
+     * blocks for TCP I/O, so a short bounded block here (ATTRIBUTE_HYDRATE_TIMEOUT_MS) to
+     * read one attribute is consistent with what this thread already does - and it is only
+     * ever paid once per target after a (re)start, never on the normal cached path.
+     * Any failure here (service unavailable, timeout, no prior value) safely defaults to 0
+     * rather than blocking indefinitely or failing the actual downlink command over it.
+     */
+    private int hydrateFailureCount(TbContext ctx, TbMsg msg) {
+        try {
+            ListenableFuture<Optional<AttributeKvEntry>> future = ctx.getAttributesService()
+                    .find(ctx.getTenantId(), msg.getOriginator(), AttributeScope.SERVER_SCOPE, FAILURE_COUNT_ATTRIBUTE_KEY);
+            Optional<AttributeKvEntry> entry = future.get(ATTRIBUTE_HYDRATE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            return entry.flatMap(AttributeKvEntry::getLongValue).map(Long::intValue).orElse(0);
+        } catch (Exception e) {
+            log.warn("Could not hydrate consecutive-connect-failure count for {} - assuming 0: {}",
+                    msg.getOriginator(), e.getMessage());
+            return 0;
+        }
+    }
+
+    /**
+     * Write-through: persists the current count to the device's SERVER_SCOPE attribute in
+     * the background, never blocking the TCP command itself. If this fails or is never
+     * reached (e.g. a crash right after the in-memory increment), the durable copy is left
+     * one failure behind - a narrow, acceptable gap, and far better than losing the whole
+     * count on every restart the way a plain in-memory-only counter would.
+     */
+    private void persistFailureCountAsync(TbContext ctx, TbMsg msg, int count) {
+        try {
+            AttributeKvEntry entry = new BaseAttributeKvEntry(
+                    new LongDataEntry(FAILURE_COUNT_ATTRIBUTE_KEY, (long) count), System.currentTimeMillis());
+            ListenableFuture<AttributesSaveResult> future = ctx.getAttributesService()
+                    .save(ctx.getTenantId(), msg.getOriginator(), AttributeScope.SERVER_SCOPE, entry);
+            Futures.addCallback(future, new FutureCallback<AttributesSaveResult>() {
+                @Override
+                public void onSuccess(AttributesSaveResult result) {
+                    // Durable copy updated - nothing else to do.
+                }
+
+                @Override
+                public void onFailure(Throwable t) {
+                    log.warn("Failed to persist consecutive-connect-failure count ({}) for {}: {}",
+                            count, msg.getOriginator(), t.getMessage());
+                }
+            }, ctx.getDbCallbackExecutor());
+        } catch (Exception e) {
+            log.warn("Could not schedule persistence of consecutive-connect-failure count ({}) for {}: {}",
+                    count, msg.getOriginator(), e.getMessage());
+        }
+    }
+
+    /**
+     * Called on every CONNECT-phase failure only (a WRITE/READ-phase failure means the
+     * connection itself succeeded, so it neither increments nor resets this). Increments
+     * the per-target count, tags the message with the running count, and - the moment the
+     * count exactly reaches alarmThreshold - flags alarm_action=RAISE exactly once (not on
+     * every failure after that: incrementAndGet() hands each integer value to exactly one
+     * caller, so "== alarmThreshold" can never fire twice for the same threshold crossing)
+     * for a downstream rule chain's Create Alarm node to act on.
+     *
+     * @param metaData the metadata object that will actually flow downstream (the failure
+     *                  message's own copy) - mutated directly, not {@code msg.getMetaData()}.
+     */
+    private void recordConnectFailure(TbContext ctx, TbMsg msg, String target, TbMsgMetaData metaData) {
+        AtomicInteger counter = getOrHydrateCounter(ctx, msg, target);
+        int count = counter.incrementAndGet();
+        persistFailureCountAsync(ctx, msg, count);
+
+        if (metaData != null) {
+            metaData.putValue("consecutive_failures", String.valueOf(count));
+            if (count == alarmThreshold) {
+                metaData.putValue("alarm_action", "RAISE");
+            }
+        }
+    }
+
+    /**
+     * Called on every fully successful round-trip (CONNECT and WRITE/READ both
+     * succeeded). Resets the per-target count to 0. If the count had actually crossed
+     * alarmThreshold before this success (i.e. an alarm was plausibly raised), flags
+     * alarm_action=CLEAR for a downstream Clear Alarm node - a target that was already
+     * healthy succeeding never gets a spurious CLEAR.
+     *
+     * @param metaData the metadata object that will actually flow downstream (the success
+     *                  message's own copy) - mutated directly, not {@code msg.getMetaData()}.
+     */
+    private void recordConnectSuccess(TbContext ctx, TbMsg msg, String target, TbMsgMetaData metaData) {
+        AtomicInteger counter = getOrHydrateCounter(ctx, msg, target);
+        int previous = counter.getAndSet(0);
+        if (previous > 0) {
+            persistFailureCountAsync(ctx, msg, 0);
+        }
+        if (previous >= alarmThreshold && metaData != null) {
+            metaData.putValue("alarm_action", "CLEAR");
+        }
     }
 
     // Helper: create SSLSocketFactory from PEM strings (CA, client cert, private
@@ -329,85 +623,54 @@ public class TbSendToTcpNode implements TbNode {
 
     // Wrap PKCS#1 RSA private key in PKCS#8 structure
     private byte[] wrapRsaPkcs1InPkcs8(byte[] pkcs1Bytes) throws Exception {
-        // PKCS#8 header for RSA: SEQUENCE { SEQUENCE { OID rsaEncryption, NULL }, OCTET
-        // STRING { pkcs1 key } }
         byte[] rsaOid = new byte[] { 0x06, 0x09, 0x2a, (byte) 0x86, 0x48, (byte) 0x86, (byte) 0xf7, 0x0d, 0x01, 0x01,
                 0x01 };
         byte[] nullTag = new byte[] { 0x05, 0x00 };
-
-        // Build AlgorithmIdentifier SEQUENCE
         byte[] algIdSeq = buildAsn1Sequence(concatBytes(rsaOid, nullTag));
-
-        // Build OCTET STRING containing PKCS#1 key
         byte[] octetString = buildAsn1OctetString(pkcs1Bytes);
-
-        // Build outer SEQUENCE containing version(0), AlgorithmIdentifier, and OCTET
-        // STRING
-        byte[] version = new byte[] { 0x02, 0x01, 0x00 }; // INTEGER 0
+        byte[] version = new byte[] { 0x02, 0x01, 0x00 };
         byte[] pkcs8Content = concatBytes(version, concatBytes(algIdSeq, octetString));
         return buildAsn1Sequence(pkcs8Content);
     }
 
     // Parse SEC1 EC private key format
     private java.security.PrivateKey parseEc1PrivateKey(byte[] sec1Bytes) throws Exception {
-        // SEC1 format: SEQUENCE { version INTEGER, privateKey OCTET STRING, [0]
-        // parameters, [1] publicKey }
-        // We need to wrap this in PKCS#8 format for Java's KeyFactory
-
-        // Extract the curve OID from the SEC1 structure (context tag [0])
         byte[] curveOid = extractCurveOidFromSec1(sec1Bytes);
         if (curveOid == null) {
-            // Default to prime256v1 (P-256) if no curve specified
             curveOid = new byte[] { 0x06, 0x08, 0x2a, (byte) 0x86, 0x48, (byte) 0xce, 0x3d, 0x03, 0x01, 0x07 };
         }
-
-        // Build PKCS#8 structure for EC key
-        // AlgorithmIdentifier: SEQUENCE { OID ecPublicKey, OID namedCurve }
         byte[] ecOid = new byte[] { 0x06, 0x07, 0x2a, (byte) 0x86, 0x48, (byte) 0xce, 0x3d, 0x02, 0x01 };
         byte[] algIdContent = concatBytes(ecOid, curveOid);
         byte[] algIdSeq = buildAsn1Sequence(algIdContent);
-
-        // Build OCTET STRING containing SEC1 key
         byte[] octetString = buildAsn1OctetString(sec1Bytes);
-
-        // Build outer SEQUENCE: version(0), AlgorithmIdentifier, OCTET STRING
         byte[] version = new byte[] { 0x02, 0x01, 0x00 };
         byte[] pkcs8Content = concatBytes(version, concatBytes(algIdSeq, octetString));
         byte[] pkcs8Bytes = buildAsn1Sequence(pkcs8Content);
-
         java.security.spec.PKCS8EncodedKeySpec keySpec = new java.security.spec.PKCS8EncodedKeySpec(pkcs8Bytes);
         return java.security.KeyFactory.getInstance("EC").generatePrivate(keySpec);
     }
 
     // Extract curve OID from SEC1 structure
     private byte[] extractCurveOidFromSec1(byte[] sec1Bytes) {
-        // Look for context tag [0] which contains the curve parameters (OID)
         int pos = 0;
         if (sec1Bytes[pos] != 0x30)
-            return null; // Not a SEQUENCE
+            return null;
         pos++;
         pos += lengthOfLength(sec1Bytes, pos);
-
-        // Skip version
         if (sec1Bytes[pos] != 0x02)
             return null;
         pos++;
         int verLen = sec1Bytes[pos] & 0xFF;
         pos += 1 + verLen;
-
-        // Skip private key OCTET STRING
         if (sec1Bytes[pos] != 0x04)
             return null;
         pos++;
         int keyLen = readAsn1Length(sec1Bytes, pos);
         pos += lengthOfLength(sec1Bytes, pos) + keyLen;
-
-        // Look for context tag [0] = 0xA0
         if (pos < sec1Bytes.length && (sec1Bytes[pos] & 0xFF) == 0xA0) {
             pos++;
             int paramLen = readAsn1Length(sec1Bytes, pos);
             pos += lengthOfLength(sec1Bytes, pos);
-            // Extract the OID
             byte[] oid = new byte[paramLen];
             System.arraycopy(sec1Bytes, pos, oid, 0, paramLen);
             return oid;
@@ -469,6 +732,5 @@ public class TbSendToTcpNode implements TbNode {
         System.arraycopy(b, 0, result, a.length, b.length);
         return result;
     }
-
 
 }
